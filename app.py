@@ -46,6 +46,43 @@ def limpar_nome_mecanico(valor: str) -> str:
     nome = nome.strip().title()
     return nome if nome else ""
 
+def normalizar_maquina(valor) -> str:
+    """
+    Normaliza o campo de máquina:
+      - MPxxx / PAxxx            → mantém (novo padrão)
+      - Números puros 1-4 dígitos → mantém (legado, ex: '038')
+      - S/N, SN, Sem número, NÃO TEM, etc. → 'S/N'
+      - Descrições de problema / frases longas → '' (inválido, será removido)
+    """
+    import re
+    if not isinstance(valor, str):
+        return ""
+    v = valor.strip()
+
+    # Sem número → padroniza como S/N
+    if re.fullmatch(r'(?i)(s/?n|sem\s*n[uú]mero|n[aã]o\s*tem|sem\s*pat|s\.?n\.?)', v):
+        return "S/N"
+
+    # Novo padrão: MP001, PA045, etc.
+    if re.fullmatch(r'(?i)(MP|PA)\d{1,4}', v):
+        return v.upper()
+
+    # Legado: só números (patrimônio puro), ex: '038', '13', '1207'
+    if re.fullmatch(r'\d{1,4}', v):
+        return v.zfill(3)   # normaliza p/ 3 dígitos: '38' → '038'
+
+    # Qualquer outro padrão curto sem espaço pode ser código legado (ex: "Sn")
+    if re.fullmatch(r'[A-Za-z]{1,3}\d*', v) and len(v) <= 6:
+        return v.upper()
+
+    # Se tiver mais de 4 palavras ou mais de 25 caracteres → descrição de problema → inválido
+    palavras = v.split()
+    if len(palavras) >= 3 or len(v) > 25:
+        return ""
+
+    return v  # outros casos curtos: mantém
+
+
 def expandir_mecanicos(df: pd.DataFrame, col: str) -> pd.DataFrame:
     """
     Linhas com múltiplos mecânicos ("Lucas/Janailson", "Alexandre E Lucas")
@@ -238,6 +275,15 @@ if not df_retornos.empty and col_mecanico != "(nenhuma)" and col_mecanico in df_
 
 maq_col_ret = col_maq_ret if col_maq_ret != "(nenhuma)" else None
 
+# ── Normalizar máquinas ────────────────────────────────────────────────────────
+for _df, _col in [(df_chamados, col_maquina), (df_retornos, maq_col_ret)]:
+    if _df is not None and not _df.empty and _col and _col != "(nenhuma)" and _col in _df.columns:
+        _df[_col] = _df[_col].apply(normalizar_maquina)
+        # Remove linhas com máquina inválida (campo vazio após normalização)
+        mask_valido = _df[_col].str.strip().astype(bool)
+        _df.drop(_df[~mask_valido].index, inplace=True)
+        _df.reset_index(drop=True, inplace=True)
+
 # ── Calcular tempos ────────────────────────────────────────────────────────────
 df_retornos = calcular_tempos(df_chamados, df_retornos, col_data_cham, col_maquina, col_data_ret, maq_col_ret)
 
@@ -275,6 +321,18 @@ if not df_chamados.empty and col_maquina != "(nenhuma)":
 if not df_retornos.empty and maq_col_ret:
     maquinas += df_retornos[maq_col_ret].dropna().unique().tolist()
 maquinas = sorted(set(maquinas))
+
+# Filtro por linha de produção
+import re as _re
+def _linha(m):
+    if _re.match(r'(?i)^MP', str(m)): return "🥟 Pastel (MP)"
+    if _re.match(r'(?i)^PA', str(m)): return "🧄 Pão de Alho (PA)"
+    if str(m) == "S/N":               return "❓ Sem número"
+    return "📦 Legado (número)"
+
+linhas_disp = sorted(set(_linha(m) for m in maquinas))
+sel_linhas  = st.sidebar.multiselect("Linha de produção", linhas_disp, default=linhas_disp)
+maquinas    = [m for m in maquinas if _linha(m) in sel_linhas]
 sel_maquinas = st.sidebar.multiselect("Máquinas", maquinas, default=maquinas)
 
 def filter_df(df, date_col, maq_col_name, mec_col_name=None):
@@ -434,6 +492,9 @@ with tab_maquina:
         if num_cols:
             maq_df["Total"] = maq_df[num_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
             maq_df = maq_df.sort_values("Total", ascending=False)
+
+        # Coluna de linha de produção
+        maq_df.insert(1, "Linha", maq_df["Máquina"].apply(_linha))
 
         col_t, col_g = st.columns([1, 2])
         with col_t:
