@@ -513,14 +513,15 @@ def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_d
     if col_tipo_real != col_tipo:
         st.caption(f"ℹ️ Coluna detectada automaticamente: **{col_tipo_real}**")
 
-    # ── Diagnóstico (expander) ─────────────────────────────────────────────
-    with st.expander("🔍 Diagnóstico – clique para ver detalhes da detecção"):
-        st.write(f"**Coluna usada:** `{col_tipo_real}`")
-        st.write(f"**Total de chamados carregados:** {len(df_ch)}")
-        vals_unicos = df_ch[col_tipo_real].dropna().astype(str).str.strip().value_counts().head(10)
-        st.write("**Valores únicos nessa coluna (top 10):**")
-        st.dataframe(vals_unicos.reset_index().rename(columns={"index": "Valor", col_tipo_real: "Qtd"}),
-                     hide_index=True, use_container_width=False)
+    # ── Diagnóstico sempre visível ────────────────────────────────────────
+    st.info(f"🔎 **Coluna detectada:** `{col_tipo_real}` — **Total de chamados carregados:** {len(df_ch)}")
+    vals_unicos = df_ch[col_tipo_real].astype(str).str.strip().value_counts(dropna=False).head(15)
+    st.caption("Todos os valores encontrados na coluna (incluindo vazios como 'nan'):")
+    st.dataframe(
+        vals_unicos.reset_index().rename(columns={"index": "Valor na planilha", col_tipo_real: "Qtd",
+                                                   "count": "Qtd"}),
+        hide_index=True, use_container_width=False
+    )
 
     mask_prev = _mask_preventiva(df_ch, col_tipo_real)
     df_p = df_ch[mask_prev].copy()
