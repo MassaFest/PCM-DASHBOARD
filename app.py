@@ -438,26 +438,40 @@ def _auto_detectar_col_preventiva(df_ch: pd.DataFrame, col_configurada: str) -> 
     """
     Garante que retornamos uma coluna que realmente contém chamados preventivos.
     1. Tenta a coluna configurada no sidebar.
-    2. Se não achar nada, varre TODAS as colunas procurando por 'Sim'/'Preventiva'.
+    2. Varre colunas cujo NOME sugere tipo de manutenção.
+    3. Varre TODAS as colunas procurando pelos valores 'Sim'/'Preventiva'.
     Retorna o nome da coluna encontrada, ou '(nenhuma)'.
     """
     if df_ch.empty:
         return "(nenhuma)"
 
-    # Tenta a coluna já configurada
+    def _tem_preventiva(col):
+        try:
+            vals = df_ch[col].dropna().astype(str).str.strip().str.lower()
+            return vals.str.contains(r"^sim$|^s$|preventiv", na=False, regex=True).any()
+        except Exception:
+            return False
+
+    # 1. Tenta a coluna já configurada
     if col_configurada != "(nenhuma)" and col_configurada in df_ch.columns:
-        if _mask_preventiva(df_ch, col_configurada).any():
+        if _tem_preventiva(col_configurada):
             return col_configurada
 
-    # Busca automática em todas as colunas
+    # 2. Colunas cujo nome contém palavras-chave (aceita qualquer encoding)
+    keywords = ("prev", "manut", "tipo", "servi")
     for col in df_ch.columns:
-        col_l = col.lower()
-        if any(k in col_l for k in ("prev", "manut", "tipo", "servi")):
-            try:
-                if _mask_preventiva(df_ch, col).any():
-                    return col
-            except Exception:
-                continue
+        try:
+            col_ascii = unicodedata.normalize("NFD", col).encode("ascii", "ignore").decode().lower()
+        except Exception:
+            col_ascii = col.lower()
+        if any(k in col_ascii for k in keywords):
+            if _tem_preventiva(col):
+                return col
+
+    # 3. Varre TODAS as colunas pelos valores (último recurso)
+    for col in df_ch.columns:
+        if _tem_preventiva(col):
+            return col
 
     return "(nenhuma)"
 
