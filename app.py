@@ -515,13 +515,11 @@ def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_d
 
     # ── Diagnóstico sempre visível ────────────────────────────────────────
     st.info(f"🔎 **Coluna detectada:** `{col_tipo_real}` — **Total de chamados carregados:** {len(df_ch)}")
-    vals_unicos = df_ch[col_tipo_real].astype(str).str.strip().value_counts(dropna=False).head(15)
+    _vals = df_ch[col_tipo_real].astype(str).str.strip().value_counts(dropna=False).head(15)
+    _df_diag = _vals.reset_index()
+    _df_diag.columns = ["Valor na planilha", "Qtd"]
     st.caption("Todos os valores encontrados na coluna (incluindo vazios como 'nan'):")
-    st.dataframe(
-        vals_unicos.reset_index().rename(columns={"index": "Valor na planilha", col_tipo_real: "Qtd",
-                                                   "count": "Qtd"}),
-        hide_index=True, use_container_width=False
-    )
+    st.dataframe(_df_diag, hide_index=True, use_container_width=False)
 
     mask_prev = _mask_preventiva(df_ch, col_tipo_real)
     df_p = df_ch[mask_prev].copy()
