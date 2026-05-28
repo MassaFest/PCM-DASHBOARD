@@ -434,44 +434,59 @@ def _mask_preventiva(df_ch, col_tipo) -> "pd.Series":
         return vals.str.contains("prev", na=False)
 
 
+def _ascii_lower(s: str) -> str:
+    """Remove acentos e retorna string em minúsculas — para comparação robusta."""
+    try:
+        return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
+    except Exception:
+        return s.lower()
+
+
 def _auto_detectar_col_preventiva(df_ch: pd.DataFrame, col_configurada: str) -> str:
     """
-    Garante que retornamos uma coluna que realmente contém chamados preventivos.
-    1. Tenta a coluna configurada no sidebar.
-    2. Varre colunas cujo NOME sugere tipo de manutenção.
-    3. Varre TODAS as colunas procurando pelos valores 'Sim'/'Preventiva'.
-    Retorna o nome da coluna encontrada, ou '(nenhuma)'.
+    Retorna a coluna que representa 'Manutenção é preventiva?' ou 'Tipo de Manutenção'.
+    Prioridade:
+      1. Coluna configurada no sidebar (se tiver valores preventivos)
+      2. Coluna cujo nome contém 'preventiv'  (ex: 'Manutenção é preventiva?')
+      3. Coluna cujo nome contém 'tipo' ou 'manut' E que tem valor 'Preventiva' nos dados
+    Nunca pega colunas só por ter 'Sim' sem relação com manutenção.
     """
     if df_ch.empty:
         return "(nenhuma)"
 
-    def _tem_preventiva(col):
+    def _tem_valor_preventiva(col):
+        """A coluna tem algum valor que signifique preventiva (não só 'Sim' genérico)?"""
+        try:
+            vals = df_ch[col].dropna().astype(str).str.strip().str.lower()
+            return vals.str.contains("preventiv", na=False).any()
+        except Exception:
+            return False
+
+    def _tem_sim_ou_preventiva(col):
+        """A coluna é do tipo 'É preventiva?' (sim/não) ou contém 'Preventiva'?"""
         try:
             vals = df_ch[col].dropna().astype(str).str.strip().str.lower()
             return vals.str.contains(r"^sim$|^s$|preventiv", na=False, regex=True).any()
         except Exception:
             return False
 
-    # 1. Tenta a coluna já configurada
+    # 1. Coluna configurada no sidebar
     if col_configurada != "(nenhuma)" and col_configurada in df_ch.columns:
-        if _tem_preventiva(col_configurada):
+        if _tem_sim_ou_preventiva(col_configurada):
             return col_configurada
 
-    # 2. Colunas cujo nome contém palavras-chave (aceita qualquer encoding)
-    keywords = ("prev", "manut", "tipo", "servi")
+    # 2. Coluna cujo nome contém 'preventiv' (mais específico — pega 'Manutenção é preventiva?')
     for col in df_ch.columns:
-        try:
-            col_ascii = unicodedata.normalize("NFD", col).encode("ascii", "ignore").decode().lower()
-        except Exception:
-            col_ascii = col.lower()
-        if any(k in col_ascii for k in keywords):
-            if _tem_preventiva(col):
+        if "preventiv" in _ascii_lower(col):
+            if _tem_sim_ou_preventiva(col):
                 return col
 
-    # 3. Varre TODAS as colunas pelos valores (último recurso)
+    # 3. Coluna cujo nome contém 'tipo' ou 'manut' E que tem a palavra 'Preventiva' nos dados
     for col in df_ch.columns:
-        if _tem_preventiva(col):
-            return col
+        col_a = _ascii_lower(col)
+        if any(k in col_a for k in ("tipo", "manut")):
+            if _tem_valor_preventiva(col):
+                return col
 
     return "(nenhuma)"
 
