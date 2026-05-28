@@ -434,6 +434,34 @@ def _mask_preventiva(df_ch, col_tipo) -> "pd.Series":
         return vals.str.contains("prev", na=False)
 
 
+def _auto_detectar_col_preventiva(df_ch: pd.DataFrame, col_configurada: str) -> str:
+    """
+    Garante que retornamos uma coluna que realmente contém chamados preventivos.
+    1. Tenta a coluna configurada no sidebar.
+    2. Se não achar nada, varre TODAS as colunas procurando por 'Sim'/'Preventiva'.
+    Retorna o nome da coluna encontrada, ou '(nenhuma)'.
+    """
+    if df_ch.empty:
+        return "(nenhuma)"
+
+    # Tenta a coluna já configurada
+    if col_configurada != "(nenhuma)" and col_configurada in df_ch.columns:
+        if _mask_preventiva(df_ch, col_configurada).any():
+            return col_configurada
+
+    # Busca automática em todas as colunas
+    for col in df_ch.columns:
+        col_l = col.lower()
+        if any(k in col_l for k in ("prev", "manut", "tipo", "servi")):
+            try:
+                if _mask_preventiva(df_ch, col).any():
+                    return col
+            except Exception:
+                continue
+
+    return "(nenhuma)"
+
+
 def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_data, col_mec, catalogo):
     """
     Mostra chamados marcados como 'preventiva' em ordem cronológica inversa.
@@ -441,21 +469,48 @@ def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_d
     """
     st.subheader("🆕 Chamados Preventivos – Prontos para Programar")
 
-    if df_ch.empty or col_tipo == "(nenhuma)" or col_tipo not in df_ch.columns:
-        st.warning("Configure a coluna **'Tipo Manutenção'** nos chamados (menu lateral → Colunas – Chamados) para usar esta função.")
+    if df_ch.empty:
+        st.warning("Nenhum dado de chamados carregado.")
         return
 
-    mask_prev = _mask_preventiva(df_ch, col_tipo)
+    # Auto-detecta a melhor coluna, independente do seletor do menu lateral
+    col_tipo_real = _auto_detectar_col_preventiva(df_ch, col_tipo)
+
+    if col_tipo_real == "(nenhuma)":
+        st.warning("Não foi possível identificar a coluna de tipo de manutenção. "
+                   "Verifique no menu lateral **Colunas – Chamados → Tipo Manutenção**.")
+        return
+
+    if col_tipo_real != col_tipo:
+        st.caption(f"ℹ️ Coluna detectada automaticamente: **{col_tipo_real}**")
+
+    mask_prev = _mask_preventiva(df_ch, col_tipo_real)
     df_p = df_ch[mask_prev].copy()
 
     if df_p.empty:
         st.info("✅ Nenhum chamado do tipo 'preventiva' encontrado. Tudo em dia!")
         return
 
+    # Auto-detecta coluna de patrimônio: prefere coluna com código (MP/PA + números)
+    col_pat_auto = col_maq
+    for _c in df_p.columns:
+        _c_l = _c.lower()
+        if any(k in _c_l for k in ("plaqueta", "patrimônio", "patrimonio", "tag", "codigo", "código")):
+            _sample = df_p[_c].dropna().astype(str).head(20)
+            if _sample.str.contains(r"^(MP|PA|mp|pa)\d+$", regex=True).any():
+                col_pat_auto = _c
+                break
+
     # Monta DataFrame de exibição
     rows = []
     for _, row in df_p.iterrows():
-        maq       = str(row[col_maq]).strip()  if col_maq  != "(nenhuma)" and col_maq  in df_p.columns else "—"
+        # Pega o patrimônio (código MPxxx/PAxxx)
+        maq = "—"
+        if col_pat_auto != "(nenhuma)" and col_pat_auto in df_p.columns:
+            maq = str(row[col_pat_auto]).strip()
+        elif col_maq != "(nenhuma)" and col_maq in df_p.columns:
+            maq = str(row[col_maq]).strip()
+
         problema  = str(row[col_prob]).strip() if col_prob != "(nenhuma)" and col_prob in df_p.columns else "—"
         data_raw  = row[col_data]              if col_data != "(nenhuma)" and col_data in df_p.columns else None
         mecanico  = str(row[col_mec]).strip()  if col_mec  != "(nenhuma)" and col_mec  in df_p.columns else "—"
