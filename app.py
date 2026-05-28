@@ -771,6 +771,15 @@ with st.sidebar:
     antecedencia     = st.slider("⏰ Alertar com antecedência (dias)", 1, 30, 7)
     if st.button("🔄 Atualizar dados"):
         st.cache_data.clear()
+        st.rerun()
+    if st.button("⚙️ Redefinir mapeamento de colunas"):
+        # Limpa session state dos seletores de coluna para forçar re-detecção automática
+        for _k in ["c_data","c_maq","c_pat","c_prob","c_enc","c_tipo",
+                   "r_data","r_mec","r_maq","r_serv","r_stat"]:
+            if _k in st.session_state:
+                del st.session_state[_k]
+        st.cache_data.clear()
+        st.rerun()
     st.markdown("---")
     st.subheader("Agrupamento de nomes")
     similaridade = st.slider(
@@ -855,6 +864,28 @@ maq_col_ret = col_maq_ret if col_maq_ret != "(nenhuma)" else None
 
 # ── Salva cópia ANTES da normalização (para uso em Novos Chamados Preventivos) ──
 df_chamados_full = df_chamados.copy()
+
+# ── Garante que col_maquina aponta para a coluna com códigos MP/PA ────────────
+# Se o seletor estiver numa coluna de descrição (sem MP/PA), corrige automaticamente
+def _detectar_col_patrimonio(df, col_atual):
+    """Retorna a melhor coluna com códigos de patrimônio (MP/PA + números)."""
+    if col_atual != "(nenhuma)" and col_atual in df.columns:
+        _sample = df[col_atual].dropna().astype(str).str.strip()
+        if _sample.str.match(r"^(MP|PA)\d+$", na=False).mean() >= 0.3:
+            return col_atual  # já é boa
+    # Busca em todas as colunas
+    melhor_col = col_atual
+    melhor_taxa = 0.0
+    for _c in df.columns:
+        _s = df[_c].dropna().astype(str).str.strip()
+        _taxa = _s.str.match(r"^(MP|PA|\d{1,4})$", na=False).mean()
+        if _taxa > melhor_taxa:
+            melhor_taxa = _taxa
+            melhor_col = _c
+    return melhor_col if melhor_taxa > 0.1 else col_atual
+
+if not df_chamados.empty:
+    col_maquina = _detectar_col_patrimonio(df_chamados, col_maquina)
 
 # ── Normalizar máquinas ────────────────────────────────────────────────────────
 for _df, _col in [(df_chamados, col_maquina), (df_retornos, maq_col_ret)]:
