@@ -48,39 +48,44 @@ def limpar_nome_mecanico(valor: str) -> str:
 
 def normalizar_maquina(valor) -> str:
     """
-    Normaliza o campo de máquina:
-      - MPxxx / PAxxx            → mantém (novo padrão)
-      - Números puros 1-4 dígitos → mantém (legado, ex: '038')
-      - S/N, SN, Sem número, NÃO TEM, etc. → 'S/N'
-      - Descrições de problema / frases longas → '' (inválido, será removido)
+    Aceita APENAS três formatos. Todo o resto é descartado.
+      1. MPxxx / PAxxx  → ex: MP001, PA045  (novo padrão)
+      2. Número puro     → ex: 001, 038, 13  (legado)
+      3. Sem número      → qualquer variação → 'S/N'
     """
-    import re
+    import re, unicodedata
+
     if not isinstance(valor, str):
         return ""
+
+    # Normaliza encoding (remove acentos para comparação)
     v = valor.strip()
+    v_norm = unicodedata.normalize("NFD", v.lower())
+    v_norm = re.sub(r'[̀-ͯ]', '', v_norm)  # remove diacríticos
 
-    # Sem número → padroniza como S/N
-    if re.fullmatch(r'(?i)(s/?n|sem\s*n[uú]mero|n[aã]o\s*tem|sem\s*pat|s\.?n\.?)', v):
-        return "S/N"
+    # ── Sem número → tudo vira S/N ──────────────────────────────────────────
+    sem_numero = [
+        r'^s\s*[/\\.]?\s*n\.?$',           # S/N, SN, S.N., s n
+        r'^sem\s*nu?me?ro$',                # sem numero, sem nmero
+        r'^na?o\s*tem$',                    # não tem, nao tem
+        r'^sem\s*pat',                      # sem patrimônio
+        r'^nao\s*ha$',                      # não há
+        r'^nenhum[ao]?$',                   # nenhum
+    ]
+    for pat in sem_numero:
+        if re.match(pat, v_norm):
+            return "S/N"
 
-    # Novo padrão: MP001, PA045, etc.
+    # ── Novo padrão: MP ou PA + 1 a 4 dígitos ───────────────────────────────
     if re.fullmatch(r'(?i)(MP|PA)\d{1,4}', v):
         return v.upper()
 
-    # Legado: só números (patrimônio puro), ex: '038', '13', '1207'
+    # ── Legado: APENAS dígitos, 1 a 4 caracteres ────────────────────────────
     if re.fullmatch(r'\d{1,4}', v):
-        return v.zfill(3)   # normaliza p/ 3 dígitos: '38' → '038'
+        return v.zfill(3)
 
-    # Qualquer outro padrão curto sem espaço pode ser código legado (ex: "Sn")
-    if re.fullmatch(r'[A-Za-z]{1,3}\d*', v) and len(v) <= 6:
-        return v.upper()
-
-    # Se tiver mais de 4 palavras ou mais de 25 caracteres → descrição de problema → inválido
-    palavras = v.split()
-    if len(palavras) >= 3 or len(v) > 25:
-        return ""
-
-    return v  # outros casos curtos: mantém
+    # ── Tudo o mais é inválido ───────────────────────────────────────────────
+    return ""
 
 
 def expandir_mecanicos(df: pd.DataFrame, col: str) -> pd.DataFrame:
