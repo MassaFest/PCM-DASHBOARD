@@ -30,7 +30,8 @@ DEFAULT_SHEET_RETORNOS  = "1KO_U-Ly1s9rW2YuPdc48zwOcR6EuPf1CfBGbbSZMjEY"
 DEFAULT_GID_RETORNOS    = "824431047"
 DEFAULT_SHEET_CAT1      = "1gTmX6wTU2KBuI-dg2HHDTH-xTSNSkZXOUdQVpFmp-oo"
 DEFAULT_SHEET_CAT2      = "1bxr1yw-DcYrExfRpUYMEjf4CAm7uWe9zbDcTxB3wMfs"
-DEFAULT_SHEET_PREVENTIVA = ""   # usuário irá configurar
+DEFAULT_SHEET_PREVENTIVA = "1HKkaSGqrKSpndgqEc3UikLFtN_O98Y6HqI24ufPcTG8"
+DEFAULT_GID_PREVENTIVA   = "72568784"
 
 @st.cache_data(ttl=3600)
 def load_catalogo(sheet_id: str) -> tuple[dict, pd.DataFrame]:
@@ -416,6 +417,80 @@ def gerar_msg_telegram(row, antecedencia: int) -> str:
     )
 
 
+def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_data, col_mec, catalogo):
+    """
+    Mostra chamados marcados como 'preventiva' em ordem cronológica inversa.
+    O usuário só precisa adicionar a data planejada e colar na planilha de PMs.
+    """
+    st.subheader("🆕 Chamados Preventivos – Prontos para Programar")
+
+    if df_ch.empty or col_tipo == "(nenhuma)" or col_tipo not in df_ch.columns:
+        st.warning("Configure a coluna **'Tipo Manutenção'** nos chamados (menu lateral → Colunas – Chamados) para usar esta função.")
+        return
+
+    mask_prev = df_ch[col_tipo].astype(str).str.lower().str.contains("prev", na=False)
+    df_p = df_ch[mask_prev].copy()
+
+    if df_p.empty:
+        st.info("✅ Nenhum chamado do tipo 'preventiva' encontrado. Tudo em dia!")
+        return
+
+    # Monta DataFrame de exibição
+    rows = []
+    for _, row in df_p.iterrows():
+        maq       = str(row[col_maq]).strip()  if col_maq  != "(nenhuma)" and col_maq  in df_p.columns else "—"
+        problema  = str(row[col_prob]).strip() if col_prob != "(nenhuma)" and col_prob in df_p.columns else "—"
+        data_raw  = row[col_data]              if col_data != "(nenhuma)" and col_data in df_p.columns else None
+        mecanico  = str(row[col_mec]).strip()  if col_mec  != "(nenhuma)" and col_mec  in df_p.columns else "—"
+
+        try:
+            data_fmt = pd.to_datetime(data_raw).strftime("%d/%m/%Y")
+        except Exception:
+            data_fmt = "—"
+
+        nome_maq = catalogo.get(maq.upper(), {}).get("nome", "")
+        maq_label = f"{maq} – {nome_maq.title()}" if nome_maq else maq
+
+        rows.append({
+            "Patrimônio"        : maq,
+            "Máquina"           : maq_label,
+            "Descrição / Tarefa": problema[:100],
+            "Data do Chamado"   : data_fmt,
+            "Mecânico"          : mecanico,
+            "📅 Data Planejada" : "",    # usuário preenche antes de colar
+        })
+
+    df_out = pd.DataFrame(rows)
+
+    # Ordena pelo mais recente (tentativa com a coluna data original)
+    if col_data != "(nenhuma)" and col_data in df_p.columns:
+        datas_sort = pd.to_datetime(df_p[col_data], errors="coerce")
+        df_out.insert(0, "_sort", datas_sort.values)
+        df_out = df_out.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+
+    st.caption(f"**{len(df_out)} chamados preventivos** encontrados. Preencha a coluna '📅 Data Planejada' e cole na planilha de PMs.")
+
+    st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+    # Download TSV – abre no Excel com colunas separadas
+    tsv_bytes = df_out.to_csv(index=False, sep="\t", encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        "⬇ Baixar tabela (TSV – abre no Excel/Sheets)",
+        data=tsv_bytes,
+        file_name="chamados_preventivos.tsv",
+        mime="text/tab-separated-values",
+        use_container_width=True,
+    )
+
+    st.info("""
+    **Como usar:**
+    1. Baixe a tabela → abra no Excel ou Planilhas Google
+    2. Preencha a coluna **📅 Data Planejada** para cada item
+    3. Cole as linhas na sua **planilha de PMs preventivas**
+    4. Preencha também **Frequência_Dias**, **Tipo** e **Prioridade** se necessário
+    """)
+
+
 def _gerar_importacao_historico(df_ch, col_tipo, col_maq, col_prob, col_data, col_mec, catalogo):
     """
     Filtra os chamados do tipo 'preventiva' e gera uma tabela
@@ -578,7 +653,7 @@ with st.sidebar:
     st.subheader("Manutenção Preventiva")
     sheet_preventiva = st.text_input("ID – Planilha de PMs", DEFAULT_SHEET_PREVENTIVA,
                                      placeholder="Cole o ID da planilha aqui")
-    gid_preventiva   = st.text_input("GID – Aba de PMs", "0")
+    gid_preventiva   = st.text_input("GID – Aba de PMs", DEFAULT_GID_PREVENTIVA)
     antecedencia     = st.slider("⏰ Alertar com antecedência (dias)", 1, 30, 7)
     if st.button("🔄 Atualizar dados"):
         st.cache_data.clear()
@@ -819,16 +894,20 @@ with tab_visao:
     ))
     total_mecanicos = df_ret[col_mecanico].nunique() if col_mecanico != "(nenhuma)" and not df_ret.empty else 0
 
-    tempo_medio_geral = None
-    if "Tempo_min" in df_ret.columns:
-        tempo_medio_geral = df_ret["Tempo_min"].dropna().mean()
+    _tv = df_ret["Tempo_min"].dropna() if "Tempo_min" in df_ret.columns else pd.Series(dtype=float)
+    if len(_tv) >= 3:
+        tempo_medio_geral = _tv.median()
+        tempo_label = formatar_tempo(tempo_medio_geral)
+    elif len(_tv) > 0:
+        tempo_label = f"Poucos dados ({len(_tv)})"
+    else:
+        tempo_label = "—"
 
     c1.metric("Total de Chamados", total_chamados)
     c2.metric("Atendimentos Realizados", total_retornos)
     c3.metric("Máquinas Atendidas", total_maquinas)
     c4.metric("Mecânicos Ativos", total_mecanicos)
-    c5.metric("Tempo Médio de Atendimento",
-              formatar_tempo(tempo_medio_geral) if tempo_medio_geral else "—")
+    c5.metric("Tempo Mediano de Atendimento", tempo_label)
 
     st.markdown("---")
     col_l, col_r = st.columns(2)
@@ -1071,10 +1150,15 @@ with tab_prev:
         **Tipos sugeridos:** Lubrificação · Inspeção · Limpeza · Calibração · Troca de filtro · Revisão geral
         """)
 
-        # ── Importar preventivos do histórico ─────────────────────────────
+        # ── Novos chamados preventivos + Importar do histórico ───────────────
         st.markdown("---")
-        _gerar_importacao_historico(df_ch, col_tipo_manut, col_maquina, col_problema,
-                                    col_data_cham, col_mecanico, catalogo)
+        _tab_a, _tab_b = st.tabs(["🆕 Novos Chamados", "📥 Importar do Histórico"])
+        with _tab_a:
+            _painel_novos_chamados_preventivos(df_ch, col_tipo_manut, col_maquina, col_problema,
+                                               col_data_cham, col_mecanico, catalogo)
+        with _tab_b:
+            _gerar_importacao_historico(df_ch, col_tipo_manut, col_maquina, col_problema,
+                                        col_data_cham, col_mecanico, catalogo)
     else:
         total_pms    = len(df_prev)
         atrasadas    = (df_prev["Dias_Restantes"] < 0).sum() if "Dias_Restantes" in df_prev.columns else 0
@@ -1091,20 +1175,34 @@ with tab_prev:
                     break
         taxa = f"{n_prev/(n_prev+n_corr)*100:.0f}%" if (n_prev+n_corr) > 0 else "—"
 
-        mttr_med = df_retornos["Tempo_min"].dropna().mean() if "Tempo_min" in df_retornos.columns else None
+        # MTTR: usa mediana (robusta a outliers) e só exibe se houver dados suficientes
+        _tempo_vals = df_retornos["Tempo_min"].dropna() if "Tempo_min" in df_retornos.columns else pd.Series(dtype=float)
+        _n_mttr = len(_tempo_vals)
+        if _n_mttr >= 3:
+            mttr_med = _tempo_vals.median()
+            mttr_label = formatar_tempo(mttr_med) + f"  *(n={_n_mttr})*"
+        elif _n_mttr > 0:
+            mttr_label = f"Poucos dados ({_n_mttr})"
+        else:
+            mttr_label = "—"
 
         k1.metric("PMs Cadastradas", total_pms)
         k2.metric("⛔ Atrasadas",     int(atrasadas),  delta=f"-{int(atrasadas)}" if atrasadas else None, delta_color="inverse")
         k3.metric("⚠️ Próximas 7d",   int(proximas_7))
         k4.metric("📅 Próximas 30d",   int(proximas_30))
-        k5.metric("⏱ MTTR Médio",     formatar_tempo(mttr_med) if mttr_med else "—")
+        k5.metric("⏱ MTTR Mediana",   mttr_label)
 
         st.markdown("---")
 
-        sub1, sub2, sub3, sub4, sub5 = st.tabs(["📅 Calendário", "⚠️ Status & Alertas", "📊 Indicadores", "🤖 Mensagens Atlas", "📥 Importar do Histórico"])
+        sub1, sub2, sub3, sub4, sub5, sub6 = st.tabs(["📅 Calendário", "⚠️ Status & Alertas", "📊 Indicadores", "🤖 Mensagens Atlas", "🆕 Novos Chamados", "📥 Importar do Histórico"])
 
-        # ── Importar do histórico (disponível mesmo com preventiva já configurada) ──
+        # ── Novos chamados preventivos (principal novidade) ────────────────────
         with sub5:
+            _painel_novos_chamados_preventivos(df_ch, col_tipo_manut, col_maquina, col_problema,
+                                               col_data_cham, col_mecanico, catalogo)
+
+        # ── Importar do histórico (agrupado por máquina) ───────────────────────
+        with sub6:
             _gerar_importacao_historico(df_ch, col_tipo_manut, col_maquina, col_problema,
                                         col_data_cham, col_mecanico, catalogo)
 
