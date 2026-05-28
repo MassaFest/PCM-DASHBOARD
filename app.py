@@ -9,11 +9,20 @@ import unicodedata
 from io import StringIO, BytesIO
 
 st.set_page_config(
-    page_title="PCM Dashboard",
-    page_icon="🔧",
+    page_title="PCM MassaFest",
+    page_icon="🏭",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ── Paleta industrial laranja ──────────────────────────────────
+COR_PRIMARIA   = "#F97316"   # laranja
+COR_PERIGO     = "#ef4444"   # vermelho
+COR_AVISO      = "#eab308"   # amarelo
+COR_OK         = "#22c55e"   # verde
+COR_INFO       = "#3b82f6"   # azul
+ESCALA_LARANJA = ["#1a0a00","#7c2d00","#c2410c","#f97316","#fdba74","#fff7ed"]
+ESCALA_CALOR   = "YlOrRd"
 
 DEFAULT_SHEET_CHAMADOS  = "1AJXsR6YpgSuYrDRo_vtNpsJtn0vSQ9ayjBX_4mMTtdw"
 DEFAULT_GID_CHAMADOS    = "2143366097"
@@ -21,6 +30,7 @@ DEFAULT_SHEET_RETORNOS  = "1KO_U-Ly1s9rW2YuPdc48zwOcR6EuPf1CfBGbbSZMjEY"
 DEFAULT_GID_RETORNOS    = "824431047"
 DEFAULT_SHEET_CAT1      = "1gTmX6wTU2KBuI-dg2HHDTH-xTSNSkZXOUdQVpFmp-oo"
 DEFAULT_SHEET_CAT2      = "1bxr1yw-DcYrExfRpUYMEjf4CAm7uWe9zbDcTxB3wMfs"
+DEFAULT_SHEET_PREVENTIVA = ""   # usuário irá configurar
 
 @st.cache_data(ttl=3600)
 def load_catalogo(sheet_id: str) -> tuple[dict, pd.DataFrame]:
@@ -311,10 +321,251 @@ def calcular_tempos(df_ch, df_ret, col_data_cham, col_maquina, col_data_ret, maq
     return df_ret
 
 
+# ── Manutenção Preventiva ──────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_preventiva(sheet_id: str, gid: str = "0") -> pd.DataFrame:
+    """
+    Lê a planilha de PMs preventivas.
+    Colunas esperadas: Patrimônio | Tarefa | Tipo | Frequência_Dias |
+                       Última_Execução | Responsável | Prioridade | Observações
+    """
+    if not sheet_id.strip():
+        return pd.DataFrame()
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
+        df.columns = df.columns.str.strip()
+        return df
+    except Exception as e:
+        st.warning(f"Planilha preventiva: {e}")
+        return pd.DataFrame()
+
+
+def calcular_status_pm(row, antecedencia: int = 7) -> tuple[str, str]:
+    """Retorna (status_texto, cor_hex) baseado em dias restantes."""
+    dias = row.get("Dias_Restantes")
+    if pd.isna(dias):
+        return "Sem data", "#888888"
+    dias = int(dias)
+    if dias < 0:
+        return f"⛔ Atrasada {abs(dias)}d", "#e74c3c"
+    elif dias == 0:
+        return "🚨 Vence hoje!", "#e74c3c"
+    elif dias <= antecedencia:
+        return f"⚠️ Em {dias}d", "#f39c12"
+    elif dias <= 30:
+        return f"🔔 Em {dias}d", "#3498db"
+    else:
+        return f"✅ Em {dias}d", "#2ecc71"
+
+
+def calcular_mtbf_mttr(df_ch, df_ret, col_data_cham, col_maquina, col_data_ret, maq_col_ret):
+    """Calcula MTBF e MTTR por máquina."""
+    resultado = {}
+
+    # MTTR — já temos Tempo_min em df_ret
+    if not df_ret.empty and maq_col_ret and "Tempo_min" in df_ret.columns:
+        mttr = df_ret.groupby(maq_col_ret)["Tempo_min"].mean()
+        for maq, val in mttr.items():
+            resultado.setdefault(maq, {})["MTTR_min"] = val
+
+    # MTBF — tempo médio entre falhas consecutivas por máquina
+    if (not df_ch.empty and col_data_cham != "(nenhuma)"
+            and col_maquina != "(nenhuma)"):
+        for maq, grp in df_ch.groupby(col_maquina):
+            datas = grp[col_data_cham].dropna().sort_values()
+            if len(datas) >= 2:
+                deltas = datas.diff().dropna().dt.total_seconds() / 3600  # horas
+                mtbf_h = deltas.mean()
+                resultado.setdefault(maq, {})["MTBF_h"] = mtbf_h
+
+    if not resultado:
+        return pd.DataFrame()
+
+    df_res = pd.DataFrame(resultado).T.reset_index()
+    df_res.columns = ["Máquina"] + [c for c in df_res.columns if c != "index"]
+    return df_res
+
+
+def gerar_msg_telegram(row, antecedencia: int) -> str:
+    maq   = row.get("Patrimônio", "?")
+    nome  = catalogo.get(str(maq).upper(), {}).get("nome", "")
+    tarefa = row.get("Tarefa", "")
+    data  = row.get("Próxima_Execução", "")
+    resp  = row.get("Responsável", "")
+    prior = row.get("Prioridade", "")
+    dias  = int(row.get("Dias_Restantes", 0))
+
+    if isinstance(data, pd.Timestamp):
+        data = data.strftime("%d/%m/%Y")
+
+    emoji_prior = {"Alta": "🔴", "Média": "🟡", "Baixa": "🟢"}.get(str(prior), "⚙️")
+    aviso = "⛔ *ATRASADA*" if dias < 0 else f"🔔 Vence em *{dias} dias*"
+
+    return (
+        f"🔧 *MANUTENÇÃO PREVENTIVA*\n\n"
+        f"🏭 Máquina: *{maq}*{(' – ' + nome.title()) if nome else ''}\n"
+        f"📋 Tarefa: {tarefa}\n"
+        f"📅 Data prevista: *{data}*\n"
+        f"👷 Responsável: {resp}\n"
+        f"{emoji_prior} Prioridade: {prior}\n"
+        f"{aviso}\n\n"
+        f"_Agende a manutenção com antecedência de {antecedencia} dias._"
+    )
+
+
+def _gerar_importacao_historico(df_ch, col_tipo, col_maq, col_prob, col_data, col_mec, catalogo):
+    """
+    Filtra os chamados do tipo 'preventiva' e gera uma tabela
+    pronta para copiar/colar na planilha de PMs.
+    """
+    st.subheader("📥 Importar Preventivas do Histórico de Chamados")
+
+    if df_ch.empty or col_tipo == "(nenhuma)" or col_tipo not in df_ch.columns:
+        st.warning("Configure a coluna **'Tipo Manutenção'** nos chamados (menu lateral → Colunas – Chamados) para usar esta função.")
+        return
+
+    # Filtra preventivas
+    mask_prev = df_ch[col_tipo].astype(str).str.lower().str.contains("prev", na=False)
+    df_prev_hist = df_ch[mask_prev].copy()
+
+    if df_prev_hist.empty:
+        st.info("Nenhum chamado do tipo 'preventiva' encontrado no histórico.")
+        return
+
+    st.success(f"✅ {len(df_prev_hist)} chamados preventivos encontrados no histórico.")
+
+    # Para cada máquina, pega o mais recente
+    rows_out = []
+    col_maq_ok  = col_maq  if col_maq  != "(nenhuma)" else None
+    col_prob_ok = col_prob if col_prob != "(nenhuma)" else None
+    col_data_ok = col_data if col_data != "(nenhuma)" else None
+    col_mec_ok  = col_mec  if col_mec  != "(nenhuma)" else None
+
+    grp_col = col_maq_ok or df_prev_hist.columns[0]
+
+    for maquina, grp in df_prev_hist.groupby(grp_col):
+        # Data mais recente
+        ultima = None
+        if col_data_ok and col_data_ok in grp.columns:
+            datas = pd.to_datetime(grp[col_data_ok], errors="coerce").dropna()
+            if not datas.empty:
+                ultima = datas.max()
+
+        # Descrição mais comum (tarefa)
+        tarefa = ""
+        if col_prob_ok and col_prob_ok in grp.columns:
+            tarefa = grp[col_prob_ok].dropna().mode()
+            tarefa = str(tarefa.iloc[0]) if len(tarefa) > 0 else ""
+            tarefa = tarefa[:80]  # limita tamanho
+
+        # Mecânico mais frequente
+        responsavel = ""
+        if col_mec_ok and col_mec_ok in grp.columns:
+            resp = grp[col_mec_ok].dropna().mode()
+            responsavel = str(resp.iloc[0]) if len(resp) > 0 else ""
+
+        # Nome da máquina no catálogo
+        nome_maq = catalogo.get(str(maquina).upper(), {}).get("nome", "")
+
+        rows_out.append({
+            "Patrimônio"     : str(maquina),
+            "Nome Máquina"   : nome_maq.title() if nome_maq else "",
+            "Tarefa"         : tarefa,
+            "Tipo"           : "Inspeção",          # sugestão padrão — edite conforme necessário
+            "Frequência_Dias": 30,                   # sugestão padrão — edite conforme necessário
+            "Última_Execução": ultima.strftime("%d/%m/%Y") if ultima else "",
+            "Responsável"    : responsavel,
+            "Prioridade"     : "Média",              # sugestão padrão
+            "Observações"    : f"Importado do histórico ({len(grp)} registros)"
+        })
+
+    df_out = pd.DataFrame(rows_out).sort_values("Patrimônio")
+
+    st.markdown("#### Tabela para copiar na planilha de PMs")
+    st.caption("Revise os campos **Tarefa**, **Tipo**, **Frequência_Dias** e **Prioridade** antes de colar — foram preenchidos com sugestões padrão.")
+    st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+    # Download CSV (abre no Excel e copia facilmente)
+    csv_bytes = df_out.to_csv(index=False, sep="\t", encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        "⬇ Baixar como planilha (TSV — abre no Excel)",
+        data=csv_bytes,
+        file_name="preventivas_para_importar.csv",
+        mime="text/tab-separated-values",
+        use_container_width=True
+    )
+
+    st.info("""
+    **Como usar:**
+    1. Clique em **Baixar** → abre no Excel
+    2. Revise e ajuste **Tarefa**, **Tipo**, **Frequência** e **Prioridade** de cada máquina
+    3. Copie as linhas e cole na sua **planilha de PMs preventivas**
+    4. Cole o ID dessa planilha no menu lateral do dashboard
+    """)
+
+
+def calendario_mensal(df_pm: pd.DataFrame, ano: int, mes: int) -> go.Figure:
+    """Gera um heatmap-calendário do mês com PMs."""
+    import calendar
+    cal = calendar.monthcalendar(ano, mes)
+    dias_semana = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+
+    # Conta PMs por dia
+    pms_dia: dict[int, list] = {}
+    if not df_pm.empty and "Próxima_Execução" in df_pm.columns:
+        for _, row in df_pm.iterrows():
+            dt = row["Próxima_Execução"]
+            if pd.notna(dt) and dt.year == ano and dt.month == mes:
+                d = dt.day
+                pms_dia.setdefault(d, []).append(
+                    row.get("Patrimônio","") + " " + row.get("Tarefa","")
+                )
+
+    # Monta matriz
+    z, text, hover = [], [], []
+    for semana in cal:
+        z_row, t_row, h_row = [], [], []
+        for dia in semana:
+            if dia == 0:
+                z_row.append(None); t_row.append(""); h_row.append("")
+            else:
+                qtd = len(pms_dia.get(dia, []))
+                z_row.append(qtd)
+                t_row.append(f"<b>{dia}</b>" + (f"<br>{qtd} PM" if qtd else ""))
+                detalhe = "<br>".join(pms_dia.get(dia, []))
+                h_row.append(f"Dia {dia}<br>{detalhe}" if detalhe else f"Dia {dia} — sem PM")
+        z.append(z_row); text.append(t_row); hover.append(h_row)
+
+    fig = go.Figure(go.Heatmap(
+        z=z, text=text, hovertext=hover,
+        texttemplate="%{text}", hovertemplate="%{hovertext}<extra></extra>",
+        colorscale=[[0,"#1e2130"],[0.01,"#2ecc71"],[0.5,"#f39c12"],[1,"#e74c3c"]],
+        showscale=False, xgap=3, ygap=3,
+    ))
+    fig.update_xaxes(tickvals=list(range(7)), ticktext=dias_semana, side="top")
+    fig.update_yaxes(visible=False, autorange="reversed")
+    fig.update_layout(
+        title=f"📅 {calendar.month_name[mes]} {ano}",
+        height=320, margin=dict(t=60, b=10, l=10, r=10),
+        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+        font=dict(color="#fafafa"),
+    )
+    return fig
+
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/3208/3208728.png", width=64)
-    st.title("PCM Dashboard")
+    st.markdown("""
+    <div style='text-align:center; padding:8px 0 4px 0'>
+      <span style='font-size:2.2rem'>🏭</span><br>
+      <span style='font-size:1.3rem; font-weight:800; color:#F97316; letter-spacing:1px'>MASSAFEST</span><br>
+      <span style='font-size:0.75rem; color:#888; letter-spacing:2px'>PCM · MANUTENÇÃO</span>
+    </div>
+    """, unsafe_allow_html=True)
+    st.title("")
     st.markdown("---")
     st.subheader("Planilhas – Chamados/Retornos")
     sheet_chamados = st.text_input("ID – Chamados", DEFAULT_SHEET_CHAMADOS)
@@ -324,6 +575,11 @@ with st.sidebar:
     st.subheader("Catálogo de Máquinas")
     sheet_cat1 = st.text_input("ID – Catálogo 1 (MP)", DEFAULT_SHEET_CAT1)
     sheet_cat2 = st.text_input("ID – Catálogo 2 (PA)", DEFAULT_SHEET_CAT2)
+    st.subheader("Manutenção Preventiva")
+    sheet_preventiva = st.text_input("ID – Planilha de PMs", DEFAULT_SHEET_PREVENTIVA,
+                                     placeholder="Cole o ID da planilha aqui")
+    gid_preventiva   = st.text_input("GID – Aba de PMs", "0")
+    antecedencia     = st.slider("⏰ Alertar com antecedência (dias)", 1, 30, 7)
     if st.button("🔄 Atualizar dados"):
         st.cache_data.clear()
     st.markdown("---")
@@ -379,8 +635,9 @@ if not df_chamados.empty:
     col_patrimonio  = col_select("Patrimônio",  df_chamados, ["patrimonio","patrimônio","tag","codigo"], "c_pat")
     col_problema    = col_select("Problema",    df_chamados, ["problema","descricao","descri","falha","defeito"], "c_prob")
     col_encarregado = col_select("Encarregado", df_chamados, ["encarregado","solicitante","abertura","nome"], "c_enc")
+    col_tipo_manut  = col_select("Tipo Manutenção", df_chamados, ["tipo","manutencao","manutenção","corretiva","preventiva"], "c_tipo")
 else:
-    col_data_cham = col_maquina = col_patrimonio = col_problema = col_encarregado = "(nenhuma)"
+    col_data_cham = col_maquina = col_patrimonio = col_problema = col_encarregado = col_tipo_manut = "(nenhuma)"
 
 st.sidebar.subheader("Colunas – Retornos")
 if not df_retornos.empty:
@@ -416,6 +673,52 @@ for _df, _col in [(df_chamados, col_maquina), (df_retornos, maq_col_ret)]:
 
 # ── Calcular tempos ────────────────────────────────────────────────────────────
 df_retornos = calcular_tempos(df_chamados, df_retornos, col_data_cham, col_maquina, col_data_ret, maq_col_ret)
+
+# ── Carregar e processar preventiva ───────────────────────────────────────────
+df_prev_raw = load_preventiva(sheet_preventiva, gid_preventiva)
+df_prev     = pd.DataFrame()
+
+if not df_prev_raw.empty:
+    df_prev = df_prev_raw.copy()
+    # Detecta colunas flexíveis
+    def _find_col(df, hints):
+        for h in hints:
+            for c in df.columns:
+                if h.lower() in c.lower():
+                    return c
+        return None
+
+    c_pat  = _find_col(df_prev, ["patrimônio","patrimonio","maquina","máquina","cod"])
+    c_tar  = _find_col(df_prev, ["tarefa","task","serv","atividade"])
+    c_tipo = _find_col(df_prev, ["tipo","type"])
+    c_freq = _find_col(df_prev, ["frequência","frequencia","dias","freq"])
+    c_ult  = _find_col(df_prev, ["última","ultima","last","execu"])
+    c_resp = _find_col(df_prev, ["responsável","responsavel","mecânico","mecanico"])
+    c_pri  = _find_col(df_prev, ["prioridade","prior","urgent"])
+    c_obs  = _find_col(df_prev, ["observ","nota","obs"])
+
+    rename = {}
+    for orig, novo in [(c_pat,"Patrimônio"),(c_tar,"Tarefa"),(c_tipo,"Tipo"),
+                       (c_freq,"Frequência_Dias"),(c_ult,"Última_Execução"),
+                       (c_resp,"Responsável"),(c_pri,"Prioridade"),(c_obs,"Observações")]:
+        if orig and orig not in rename.values():
+            rename[orig] = novo
+    df_prev = df_prev.rename(columns=rename)
+
+    if "Última_Execução" in df_prev.columns:
+        df_prev["Última_Execução"] = pd.to_datetime(df_prev["Última_Execução"], dayfirst=True, errors="coerce")
+    if "Frequência_Dias" in df_prev.columns:
+        df_prev["Frequência_Dias"] = pd.to_numeric(df_prev["Frequência_Dias"], errors="coerce")
+    if "Última_Execução" in df_prev.columns and "Frequência_Dias" in df_prev.columns:
+        df_prev["Próxima_Execução"] = df_prev["Última_Execução"] + pd.to_timedelta(df_prev["Frequência_Dias"], unit="D")
+        df_prev["Dias_Restantes"]   = (df_prev["Próxima_Execução"] - pd.Timestamp.today()).dt.days
+
+    df_prev["Status"], df_prev["Cor"] = zip(*df_prev.apply(
+        lambda r: calcular_status_pm(r, antecedencia), axis=1
+    )) if len(df_prev) else ([], [])
+
+# MTBF/MTTR
+df_mtbf = calcular_mtbf_mttr(df_chamados, df_retornos, col_data_cham, col_maquina, col_data_ret, maq_col_ret)
 
 # ── Filtros principais ─────────────────────────────────────────────────────────
 st.sidebar.markdown("---")
@@ -482,7 +785,12 @@ df_ret = filter_df(df_retornos, col_data_ret,  maq_col_ret, col_mecanico if col_
 # ══════════════════════════════════════════════════════════════════════════════
 # DASHBOARD PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
-st.title("🔧 PCM – Painel de Manutenção")
+st.markdown("""
+<div style='padding:18px 0 8px 0'>
+  <span style='font-size:2rem; font-weight:900; color:#F97316'>🏭 MASSAFEST</span>
+  <span style='font-size:1.3rem; font-weight:400; color:#aaa; margin-left:12px'>Painel de Manutenção – PCM</span>
+</div>
+""", unsafe_allow_html=True)
 
 def nome_maquina(codigo: str) -> str:
     """Retorna 'MP003 – MÁQUINA DE CORTE' ou só o código se não encontrar."""
@@ -491,8 +799,9 @@ def nome_maquina(codigo: str) -> str:
         return f"{codigo} – {info['nome'].title()}"
     return str(codigo)
 
-tab_visao, tab_mecanico, tab_maquina, tab_historico, tab_dados = st.tabs([
-    "📊 Visão Geral", "👷 Por Mecânico", "🏭 Por Máquina", "📋 Histórico", "📂 Dados Brutos"
+tab_visao, tab_mecanico, tab_maquina, tab_historico, tab_prev, tab_relatorio, tab_dados = st.tabs([
+    "📊 Visão Geral", "👷 Por Mecânico", "🏭 Por Máquina", "📋 Histórico",
+    "🔧 Preventiva", "📄 Relatórios", "📂 Dados Brutos"
 ])
 
 # ─────────────────────────────────────────────
@@ -528,7 +837,7 @@ with tab_visao:
             granularidade = st.selectbox("Granularidade", ["Dia", "Semana", "Mês"], key="gran_visao")
             freq_map = {"Dia": "D", "Semana": "W", "Mês": "ME"}
             ts = df_ch.set_index(col_data_cham).resample(freq_map[granularidade]).size().reset_index(name="Chamados")
-            fig = px.bar(ts, x=col_data_cham, y="Chamados", color_discrete_sequence=["#1f77b4"])
+            fig = px.bar(ts, x=col_data_cham, y="Chamados", color_discrete_sequence=[COR_PRIMARIA])
             fig.update_layout(margin=dict(t=10, b=10))
             st.plotly_chart(fig, use_container_width=True)
         else:
@@ -540,7 +849,7 @@ with tab_visao:
             mec_count = df_ret[col_mecanico].value_counts().reset_index()
             mec_count.columns = ["Mecânico", "Atendimentos"]
             fig = px.bar(mec_count, x="Atendimentos", y="Mecânico", orientation="h",
-                         color="Atendimentos", color_continuous_scale="Blues")
+                         color="Atendimentos", color_continuous_scale="Oranges")
             fig.update_layout(margin=dict(t=10, b=10), yaxis={"categoryorder": "total ascending"})
             st.plotly_chart(fig, use_container_width=True)
         else:
@@ -640,7 +949,7 @@ with tab_maquina:
             if "Total" in maq_df.columns:
                 fig = px.bar(maq_df.head(20), x="Máquina", y="Total",
                              title="Top 20 máquinas por ocorrências",
-                             color="Total", color_continuous_scale="Reds")
+                             color="Total", color_continuous_scale=ESCALA_CALOR)
                 fig.update_layout(xaxis_tickangle=-45)
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -732,6 +1041,565 @@ with tab_historico:
             st.info("Nenhum registro encontrado para esta máquina no período selecionado.")
 
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# ABA 5: Manutenção Preventiva
+# ─────────────────────────────────────────────
+with tab_prev:
+    st.title("🔧 Gestão de Manutenção Preventiva")
+
+    # ── KPIs ──────────────────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5 = st.columns(5)
+
+    if df_prev.empty:
+        k1.metric("PMs Cadastradas", 0)
+        k2.metric("⛔ Atrasadas", 0)
+        k3.metric("⚠️ Próximas 7 dias", 0)
+        k4.metric("Taxa Prev/Corr", "—")
+        k5.metric("MTTR Médio", "—")
+        st.info("""
+        ### Como configurar a Manutenção Preventiva
+        **1. Crie uma nova planilha Google Sheets** com as colunas abaixo:
+
+        | Patrimônio | Tarefa | Tipo | Frequência_Dias | Última_Execução | Responsável | Prioridade | Observações |
+        |---|---|---|---|---|---|---|---|
+        | MP003 | Lubrificação correntes | Lubrificação | 30 | 01/05/2026 | Fernando | Alta | |
+
+        **2. Compartilhe a planilha** como pública · **3. Cole o ID** no campo do menu lateral
+
+        **Tipos sugeridos:** Lubrificação · Inspeção · Limpeza · Calibração · Troca de filtro · Revisão geral
+        """)
+
+        # ── Importar preventivos do histórico ─────────────────────────────
+        st.markdown("---")
+        _gerar_importacao_historico(df_ch, col_tipo_manut, col_maquina, col_problema,
+                                    col_data_cham, col_mecanico, catalogo)
+    else:
+        total_pms    = len(df_prev)
+        atrasadas    = (df_prev["Dias_Restantes"] < 0).sum() if "Dias_Restantes" in df_prev.columns else 0
+        proximas_7   = ((df_prev["Dias_Restantes"] >= 0) & (df_prev["Dias_Restantes"] <= 7)).sum() if "Dias_Restantes" in df_prev.columns else 0
+        proximas_30  = ((df_prev["Dias_Restantes"] >= 0) & (df_prev["Dias_Restantes"] <= 30)).sum() if "Dias_Restantes" in df_prev.columns else 0
+
+        # Taxa preventiva vs corretiva
+        n_prev = 0; n_corr = 0
+        if not df_ch.empty:
+            for col in df_ch.columns:
+                if "tipo" in col.lower() or "manut" in col.lower():
+                    n_prev = df_ch[col].str.lower().str.contains("prev", na=False).sum()
+                    n_corr = df_ch[col].str.lower().str.contains("cor",  na=False).sum()
+                    break
+        taxa = f"{n_prev/(n_prev+n_corr)*100:.0f}%" if (n_prev+n_corr) > 0 else "—"
+
+        mttr_med = df_retornos["Tempo_min"].dropna().mean() if "Tempo_min" in df_retornos.columns else None
+
+        k1.metric("PMs Cadastradas", total_pms)
+        k2.metric("⛔ Atrasadas",     int(atrasadas),  delta=f"-{int(atrasadas)}" if atrasadas else None, delta_color="inverse")
+        k3.metric("⚠️ Próximas 7d",   int(proximas_7))
+        k4.metric("📅 Próximas 30d",   int(proximas_30))
+        k5.metric("⏱ MTTR Médio",     formatar_tempo(mttr_med) if mttr_med else "—")
+
+        st.markdown("---")
+
+        sub1, sub2, sub3, sub4, sub5 = st.tabs(["📅 Calendário", "⚠️ Status & Alertas", "📊 Indicadores", "🤖 Mensagens Atlas", "📥 Importar do Histórico"])
+
+        # ── Importar do histórico (disponível mesmo com preventiva já configurada) ──
+        with sub5:
+            _gerar_importacao_historico(df_ch, col_tipo_manut, col_maquina, col_problema,
+                                        col_data_cham, col_mecanico, catalogo)
+
+        # ── Calendário Mensal ──────────────────────────────────────────────────
+        with sub1:
+            hoje = datetime.today()
+            ca, cb = st.columns([1, 3])
+            with ca:
+                ano_cal = st.selectbox("Ano",  list(range(hoje.year-1, hoje.year+3)), index=1)
+                mes_cal = st.selectbox("Mês",  list(range(1,13)),
+                                       index=hoje.month-1,
+                                       format_func=lambda m: ["Jan","Fev","Mar","Abr","Mai","Jun",
+                                                               "Jul","Ago","Set","Out","Nov","Dez"][m-1])
+            with cb:
+                fig_cal = calendario_mensal(df_prev, ano_cal, mes_cal)
+                st.plotly_chart(fig_cal, use_container_width=True)
+
+            # PMs do mês selecionado
+            if "Próxima_Execução" in df_prev.columns:
+                pm_mes = df_prev[
+                    (df_prev["Próxima_Execução"].dt.year  == ano_cal) &
+                    (df_prev["Próxima_Execução"].dt.month == mes_cal)
+                ].copy()
+                if not pm_mes.empty:
+                    pm_mes["Dia"] = pm_mes["Próxima_Execução"].dt.day
+                    cols_m = [c for c in ["Dia","Patrimônio","Tarefa","Tipo","Responsável","Prioridade","Status"] if c in pm_mes.columns]
+                    st.dataframe(pm_mes[cols_m].sort_values("Dia"), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Nenhuma PM programada para este mês.")
+
+        # ── Status & Alertas ───────────────────────────────────────────────────
+        with sub2:
+            if "Status" in df_prev.columns:
+                # Atrasadas
+                atras = df_prev[df_prev["Dias_Restantes"] < 0].copy() if "Dias_Restantes" in df_prev.columns else pd.DataFrame()
+                if not atras.empty:
+                    st.error(f"### ⛔ {len(atras)} PM(s) Atrasada(s)")
+                    cols_a = [c for c in ["Patrimônio","Tarefa","Última_Execução","Próxima_Execução","Dias_Restantes","Responsável","Prioridade"] if c in atras.columns]
+                    st.dataframe(atras[cols_a].sort_values("Dias_Restantes"), use_container_width=True, hide_index=True)
+
+                # Urgentes (dentro do prazo de antecedência)
+                urg = df_prev[(df_prev["Dias_Restantes"] >= 0) & (df_prev["Dias_Restantes"] <= antecedencia)].copy() if "Dias_Restantes" in df_prev.columns else pd.DataFrame()
+                if not urg.empty:
+                    st.warning(f"### ⚠️ {len(urg)} PM(s) Vencendo em {antecedencia} dias")
+                    cols_u = [c for c in ["Patrimônio","Tarefa","Próxima_Execução","Dias_Restantes","Responsável","Prioridade"] if c in urg.columns]
+                    st.dataframe(urg[cols_u].sort_values("Dias_Restantes"), use_container_width=True, hide_index=True)
+
+                # Todas as PMs com status
+                st.markdown("---")
+                st.subheader("📋 Todas as PMs")
+                cols_t = [c for c in ["Status","Patrimônio","Tarefa","Tipo","Frequência_Dias","Última_Execução","Próxima_Execução","Responsável","Prioridade","Observações"] if c in df_prev.columns]
+                st.dataframe(
+                    df_prev[cols_t].sort_values("Dias_Restantes") if "Dias_Restantes" in df_prev.columns else df_prev[cols_t],
+                    use_container_width=True, hide_index=True
+                )
+
+        # ── Indicadores PCM ───────────────────────────────────────────────────
+        with sub3:
+            st.subheader("📊 Indicadores de Manutenção (PCM Industrial)")
+
+            col_i1, col_i2 = st.columns(2)
+
+            with col_i1:
+                # MTBF por máquina
+                if not df_mtbf.empty and "MTBF_h" in df_mtbf.columns:
+                    st.markdown("#### ⏳ MTBF – Tempo Médio Entre Falhas")
+                    mtbf_df = df_mtbf[["Máquina","MTBF_h"]].dropna().sort_values("MTBF_h")
+                    mtbf_df["MTBF"] = mtbf_df["MTBF_h"].apply(
+                        lambda h: f"{int(h//24)}d {int(h%24)}h" if h >= 24 else f"{int(h)}h"
+                    )
+                    fig_mtbf = px.bar(mtbf_df.head(20), x="MTBF_h", y="Máquina",
+                                      orientation="h", text="MTBF",
+                                      color="MTBF_h", color_continuous_scale="RdYlGn",
+                                      title="MTBF por Máquina (maior = melhor)")
+                    fig_mtbf.update_layout(xaxis_title="Horas", yaxis_title="",
+                                           yaxis={"categoryorder":"total ascending"})
+                    st.plotly_chart(fig_mtbf, use_container_width=True)
+                else:
+                    st.info("MTBF disponível após acumular chamados históricos.")
+
+            with col_i2:
+                # MTTR por máquina
+                if not df_mtbf.empty and "MTTR_min" in df_mtbf.columns:
+                    st.markdown("#### 🔧 MTTR – Tempo Médio de Reparo")
+                    mttr_df = df_mtbf[["Máquina","MTTR_min"]].dropna().sort_values("MTTR_min", ascending=False)
+                    mttr_df["MTTR"] = mttr_df["MTTR_min"].apply(formatar_tempo)
+                    fig_mttr = px.bar(mttr_df.head(20), x="MTTR_min", y="Máquina",
+                                      orientation="h", text="MTTR",
+                                      color="MTTR_min", color_continuous_scale="RdYlGn_r",
+                                      title="MTTR por Máquina (menor = melhor)")
+                    fig_mttr.update_layout(xaxis_title="Minutos", yaxis_title="",
+                                           yaxis={"categoryorder":"total ascending"})
+                    st.plotly_chart(fig_mttr, use_container_width=True)
+                else:
+                    st.info("MTTR disponível após acumular retornos com timestamp.")
+
+            # Conformidade de PMs
+            if not df_prev.empty and "Dias_Restantes" in df_prev.columns:
+                st.markdown("---")
+                st.markdown("#### 📈 Conformidade de PMs")
+                em_dia   = (df_prev["Dias_Restantes"] >= 0).sum()
+                atrasado = (df_prev["Dias_Restantes"] < 0).sum()
+                conf_pct = em_dia / len(df_prev) * 100 if len(df_prev) > 0 else 0
+                fig_conf = go.Figure(go.Indicator(
+                    mode="gauge+number",
+                    value=conf_pct,
+                    number={"suffix": "%"},
+                    title={"text": "Índice de Conformidade"},
+                    gauge={
+                        "axis": {"range": [0, 100]},
+                        "bar":  {"color": "#2ecc71" if conf_pct >= 80 else "#f39c12" if conf_pct >= 60 else "#e74c3c"},
+                        "steps": [
+                            {"range": [0,  60], "color": "#2d1b1b"},
+                            {"range": [60, 80], "color": "#2d2510"},
+                            {"range": [80,100], "color": "#1b2d1b"},
+                        ],
+                        "threshold": {"line": {"color": "white","width": 2}, "value": 80}
+                    }
+                ))
+                fig_conf.update_layout(height=280, paper_bgcolor="#0e1117", font=dict(color="#fafafa"))
+                st.plotly_chart(fig_conf, use_container_width=True)
+
+        # ── Mensagens Atlas ────────────────────────────────────────────────────
+        with sub4:
+            st.subheader("🤖 Gerar Mensagens para o Bot Atlas")
+            st.caption(f"Mostrando PMs atrasadas + vencendo em até {antecedencia} dias")
+
+            if "Dias_Restantes" not in df_prev.columns:
+                st.info("Configure a planilha preventiva para gerar mensagens.")
+            else:
+                alerta_df = df_prev[df_prev["Dias_Restantes"] <= antecedencia].copy()
+                if alerta_df.empty:
+                    st.success("✅ Nenhuma PM requer alerta no momento!")
+                else:
+                    msgs = []
+                    for _, row in alerta_df.iterrows():
+                        msgs.append(gerar_msg_telegram(row, antecedencia))
+
+                    msg_completa = "\n\n──────────────────\n\n".join(msgs)
+
+                    st.text_area("📋 Copie e envie pelo Telegram", msg_completa, height=400)
+                    st.download_button(
+                        "⬇ Baixar mensagens (.txt)",
+                        msg_completa.encode("utf-8"),
+                        file_name=f"alertas_pm_{datetime.today().strftime('%Y%m%d')}.txt",
+                        mime="text/plain"
+                    )
+
+                    st.markdown("---")
+                    st.info("💡 **Dica**: Copie o texto acima e envie diretamente ao bot Atlas pelo Telegram, ou programe o Atlas para enviar automaticamente usando a lista de datas da planilha.")
+
+
+# ─────────────────────────────────────────────
+# ABA 6: Relatórios
+# ─────────────────────────────────────────────
+with tab_relatorio:
+    st.markdown("## 📄 Gerador de Relatórios")
+    st.caption("Relatórios exportados em Excel (.xlsx) com formatação profissional MassaFest.")
+
+    tipo_rel = st.radio(
+        "Selecione o relatório",
+        ["📅 Relatório Mensal Geral", "🔧 PMs Preventivas do Mês"],
+        horizontal=True
+    )
+
+    st.markdown("---")
+
+    # ── Seletor de período ─────────────────────────────────────────────────
+    col_pa, col_pb = st.columns(2)
+    with col_pa:
+        mes_rel = st.selectbox("Mês", list(range(1, 13)), index=datetime.today().month - 1,
+                               format_func=lambda m: ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+                                                       "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"][m-1])
+    with col_pb:
+        ano_rel = st.selectbox("Ano", list(range(datetime.today().year - 2, datetime.today().year + 1)),
+                               index=2)
+
+    ini_rel = pd.Timestamp(ano_rel, mes_rel, 1)
+    fim_rel = (ini_rel + pd.offsets.MonthEnd(0))
+    st.caption(f"Período: {ini_rel.strftime('%d/%m/%Y')} a {fim_rel.strftime('%d/%m/%Y')}")
+
+    def gerar_excel_mensal(df_ch_f, df_ret_f, col_maq, col_mec, col_data_c, col_data_r, mes, ano, catalogo):
+        from io import BytesIO
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side, numbers
+        from openpyxl.utils import get_column_letter
+        from openpyxl.chart import BarChart, Reference
+
+        wb = openpyxl.Workbook()
+
+        LARANJA = "F97316"
+        ESCURO  = "1A1A1A"
+        BRANCO  = "FFFFFF"
+        CINZA   = "F5F5F5"
+        BORDA   = Side(style="thin", color="DDDDDD")
+
+        def estilo_header(ws, row, cols):
+            for c in range(1, cols + 1):
+                cel = ws.cell(row=row, column=c)
+                cel.fill      = PatternFill("solid", fgColor=LARANJA)
+                cel.font      = Font(bold=True, color=BRANCO, size=11)
+                cel.alignment = Alignment(horizontal="center", vertical="center")
+                cel.border    = Border(bottom=Side(style="medium", color=LARANJA))
+
+        def estilo_linha(ws, row, cols, zebra=False):
+            for c in range(1, cols + 1):
+                cel = ws.cell(row=row, column=c)
+                if zebra:
+                    cel.fill = PatternFill("solid", fgColor="FFF7ED")
+                cel.border = Border(
+                    top=BORDA, bottom=BORDA, left=BORDA, right=BORDA
+                )
+                cel.alignment = Alignment(vertical="center")
+
+        def titulo_planilha(ws, texto, subtexto=""):
+            ws.merge_cells("A1:H1")
+            ws["A1"] = "🏭  MASSAFEST  –  PCM"
+            ws["A1"].font      = Font(bold=True, size=16, color=LARANJA)
+            ws["A1"].fill      = PatternFill("solid", fgColor=ESCURO)
+            ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+            ws.row_dimensions[1].height = 36
+
+            ws.merge_cells("A2:H2")
+            ws["A2"] = texto
+            ws["A2"].font      = Font(bold=True, size=13, color=BRANCO)
+            ws["A2"].fill      = PatternFill("solid", fgColor="2D2D2D")
+            ws["A2"].alignment = Alignment(horizontal="left", vertical="center")
+            ws.row_dimensions[2].height = 28
+
+            if subtexto:
+                ws.merge_cells("A3:H3")
+                ws["A3"] = subtexto
+                ws["A3"].font      = Font(italic=True, size=10, color="AAAAAA")
+                ws["A3"].fill      = PatternFill("solid", fgColor="1A1A1A")
+                ws["A3"].alignment = Alignment(horizontal="left")
+                ws.row_dimensions[3].height = 20
+
+        nome_mes = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+                    "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"][mes-1]
+
+        # ── ABA 1: Resumo ────────────────────────────────────────────────
+        ws1 = wb.active
+        ws1.title = "Resumo"
+        ws1.sheet_view.showGridLines = False
+        titulo_planilha(ws1, f"Relatório Mensal de Manutenção – {nome_mes}/{ano}",
+                        f"Gerado em {datetime.today().strftime('%d/%m/%Y às %H:%M')}")
+
+        kpis = [
+            ("Total de Chamados",      len(df_ch_f),  ""),
+            ("Atendimentos Realizados",len(df_ret_f),  ""),
+            ("Máquinas Atendidas",
+             df_ch_f[col_maq].nunique() if col_maq != "(nenhuma)" and not df_ch_f.empty else 0, ""),
+            ("Mecânicos Ativos",
+             df_ret_f[col_mec].nunique() if col_mec != "(nenhuma)" and not df_ret_f.empty else 0, ""),
+            ("Tempo Médio de Atendimento",
+             formatar_tempo(df_ret_f["Tempo_min"].dropna().mean()) if "Tempo_min" in df_ret_f.columns else "—", ""),
+        ]
+        ws1.row_dimensions[5].height = 20
+        headers_kpi = ["Indicador", "Valor", ""]
+        for c, h in enumerate(headers_kpi, 1):
+            ws1.cell(5, c, h)
+        estilo_header(ws1, 5, 3)
+
+        for i, (ind, val, _) in enumerate(kpis, 6):
+            ws1.cell(i, 1, ind).font = Font(bold=True, size=11)
+            ws1.cell(i, 2, val)
+            ws1.cell(i, 2).alignment = Alignment(horizontal="center")
+            estilo_linha(ws1, i, 3, zebra=(i % 2 == 0))
+            ws1.row_dimensions[i].height = 22
+
+        ws1.column_dimensions["A"].width = 35
+        ws1.column_dimensions["B"].width = 18
+
+        # ── ABA 2: Chamados ──────────────────────────────────────────────
+        ws2 = wb.create_sheet("Chamados")
+        ws2.sheet_view.showGridLines = False
+        titulo_planilha(ws2, f"Chamados – {nome_mes}/{ano}")
+
+        if not df_ch_f.empty:
+            colunas_ch = list(df_ch_f.columns)[:8]
+            for c, col in enumerate(colunas_ch, 1):
+                ws2.cell(5, c, str(col))
+            estilo_header(ws2, 5, len(colunas_ch))
+
+            for i, (_, row) in enumerate(df_ch_f[colunas_ch].iterrows(), 6):
+                for c, val in enumerate(row.values, 1):
+                    v = val.strftime("%d/%m/%Y %H:%M") if isinstance(val, pd.Timestamp) else str(val) if str(val) != "nan" else ""
+                    ws2.cell(i, c, v)
+                estilo_linha(ws2, i, len(colunas_ch), zebra=(i % 2 == 0))
+                ws2.row_dimensions[i].height = 20
+
+            for c in range(1, len(colunas_ch) + 1):
+                ws2.column_dimensions[get_column_letter(c)].width = 22
+
+        # ── ABA 3: Mecânicos ────────────────────────────────────────────
+        ws3 = wb.create_sheet("Mecânicos")
+        ws3.sheet_view.showGridLines = False
+        titulo_planilha(ws3, f"Desempenho de Mecânicos – {nome_mes}/{ano}")
+
+        if not df_ret_f.empty and col_mec != "(nenhuma)" and col_mec in df_ret_f.columns:
+            mec_df = df_ret_f[col_mec].value_counts().reset_index()
+            mec_df.columns = ["Mecânico", "Atendimentos"]
+            mec_df["% do Total"] = (mec_df["Atendimentos"] / mec_df["Atendimentos"].sum() * 100).round(1)
+            if "Tempo_min" in df_ret_f.columns:
+                tm = df_ret_f.groupby(col_mec)["Tempo_min"].mean().reset_index()
+                tm.columns = ["Mecânico", "Tempo_Médio_min"]
+                mec_df = mec_df.merge(tm, on="Mecânico", how="left")
+                mec_df["Tempo Médio"] = mec_df["Tempo_Médio_min"].apply(formatar_tempo)
+                mec_df = mec_df.drop(columns=["Tempo_Médio_min"])
+
+            cols_m3 = list(mec_df.columns)
+            for c, col in enumerate(cols_m3, 1):
+                ws3.cell(5, c, col)
+            estilo_header(ws3, 5, len(cols_m3))
+
+            for i, (_, row) in enumerate(mec_df.iterrows(), 6):
+                for c, val in enumerate(row.values, 1):
+                    ws3.cell(i, c, val if str(val) != "nan" else "")
+                    ws3.cell(i, c).alignment = Alignment(horizontal="center")
+                estilo_linha(ws3, i, len(cols_m3), zebra=(i % 2 == 0))
+                ws3.row_dimensions[i].height = 22
+
+            for c in range(1, len(cols_m3) + 1):
+                ws3.column_dimensions[get_column_letter(c)].width = 20
+
+        # ── ABA 4: Máquinas ─────────────────────────────────────────────
+        ws4 = wb.create_sheet("Máquinas")
+        ws4.sheet_view.showGridLines = False
+        titulo_planilha(ws4, f"Máquinas com mais Manutenção – {nome_mes}/{ano}")
+
+        if not df_ch_f.empty and col_maq != "(nenhuma)" and col_maq in df_ch_f.columns:
+            maq_cnt = df_ch_f[col_maq].value_counts().reset_index()
+            maq_cnt.columns = ["Máquina", "Chamados"]
+            maq_cnt["Nome"] = maq_cnt["Máquina"].apply(
+                lambda m: catalogo.get(str(m).upper(), {}).get("nome", "")
+            )
+            maq_cnt["Localização"] = maq_cnt["Máquina"].apply(
+                lambda m: catalogo.get(str(m).upper(), {}).get("localizacao", "")
+            )
+
+            cols_m4 = ["Máquina", "Nome", "Localização", "Chamados"]
+            for c, col in enumerate(cols_m4, 1):
+                ws4.cell(5, c, col)
+            estilo_header(ws4, 5, len(cols_m4))
+
+            for i, (_, row) in enumerate(maq_cnt.iterrows(), 6):
+                for c, col in enumerate(cols_m4, 1):
+                    ws4.cell(i, c, str(row[col]) if str(row[col]) != "nan" else "")
+                estilo_linha(ws4, i, len(cols_m4), zebra=(i % 2 == 0))
+                ws4.row_dimensions[i].height = 20
+
+            ws4.column_dimensions["A"].width = 12
+            ws4.column_dimensions["B"].width = 40
+            ws4.column_dimensions["C"].width = 25
+            ws4.column_dimensions["D"].width = 12
+
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf
+
+    def gerar_excel_preventiva(df_prev_f, mes, ano, catalogo):
+        from io import BytesIO
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        wb   = openpyxl.Workbook()
+        ws   = wb.active
+        ws.title = "PMs do Mês"
+        ws.sheet_view.showGridLines = False
+
+        LARANJA = "F97316"; ESCURO = "1A1A1A"; BRANCO = "FFFFFF"
+        VERDE = "22C55E"; VERMELHO = "EF4444"; AMARELO = "EAB308"
+        BORDA = Side(style="thin", color="DDDDDD")
+
+        nome_mes = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+                    "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"][mes-1]
+
+        ws.merge_cells("A1:I1")
+        ws["A1"] = "🏭  MASSAFEST  –  PCM"
+        ws["A1"].font      = Font(bold=True, size=16, color=LARANJA)
+        ws["A1"].fill      = PatternFill("solid", fgColor=ESCURO)
+        ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[1].height = 36
+
+        ws.merge_cells("A2:I2")
+        ws["A2"] = f"Manutenções Preventivas – {nome_mes}/{ano}"
+        ws["A2"].font      = Font(bold=True, size=13, color=BRANCO)
+        ws["A2"].fill      = PatternFill("solid", fgColor="2D2D2D")
+        ws["A2"].alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[2].height = 28
+
+        headers = ["Patrimônio","Nome Máquina","Tarefa","Tipo","Frequência","Próxima PM","Responsável","Prioridade","Status"]
+        for c, h in enumerate(headers, 1):
+            cel = ws.cell(4, c, h)
+            cel.fill      = PatternFill("solid", fgColor=LARANJA)
+            cel.font      = Font(bold=True, color=BRANCO, size=11)
+            cel.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[4].height = 24
+
+        cor_status = {"Atrasada": VERMELHO, "Urgente": AMARELO, "OK": VERDE}
+
+        row_num = 5
+        if not df_prev_f.empty and "Próxima_Execução" in df_prev_f.columns:
+            pm_mes = df_prev_f[
+                (df_prev_f["Próxima_Execução"].dt.year  == ano) &
+                (df_prev_f["Próxima_Execução"].dt.month == mes)
+            ].copy() if not df_prev_f.empty else pd.DataFrame()
+
+            df_usar = pm_mes if not pm_mes.empty else df_prev_f
+
+            for _, row in df_usar.iterrows():
+                pat  = str(row.get("Patrimônio",""))
+                nome = catalogo.get(pat.upper(), {}).get("nome", "")
+                data = row["Próxima_Execução"].strftime("%d/%m/%Y") if pd.notna(row.get("Próxima_Execução")) else ""
+                dias = row.get("Dias_Restantes", None)
+                status = "Atrasada" if (dias is not None and dias < 0) else ("Urgente" if (dias is not None and dias <= 7) else "OK")
+
+                vals = [pat, nome, row.get("Tarefa",""), row.get("Tipo",""),
+                        f"{int(row.get('Frequência_Dias',0))} dias" if row.get("Frequência_Dias") else "",
+                        data, row.get("Responsável",""), row.get("Prioridade",""), status]
+
+                for c, v in enumerate(vals, 1):
+                    cel = ws.cell(row_num, c, v)
+                    cel.alignment = Alignment(vertical="center")
+                    cel.border    = Border(top=BORDA, bottom=BORDA, left=BORDA, right=BORDA)
+                    if c == 9:  # coluna Status
+                        cor = cor_status.get(status, "888888")
+                        cel.fill = PatternFill("solid", fgColor=cor)
+                        cel.font = Font(bold=True, color=BRANCO)
+                        cel.alignment = Alignment(horizontal="center", vertical="center")
+                    elif row_num % 2 == 0:
+                        cel.fill = PatternFill("solid", fgColor="FFF7ED")
+
+                ws.row_dimensions[row_num].height = 22
+                row_num += 1
+
+        larguras = [12, 38, 28, 16, 12, 14, 16, 12, 12]
+        for c, w in enumerate(larguras, 1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf
+
+    # ── Preview e botão de download ────────────────────────────────────────
+    if tipo_rel == "📅 Relatório Mensal Geral":
+        df_ch_rel  = df_ch[(df_ch[col_data_cham]  >= ini_rel) & (df_ch[col_data_cham]  <= fim_rel)] if col_data_cham  != "(nenhuma)" and not df_ch.empty  else df_ch
+        df_ret_rel = df_ret[(df_ret[col_data_ret] >= ini_rel) & (df_ret[col_data_ret] <= fim_rel)] if col_data_ret != "(nenhuma)" and not df_ret.empty else df_ret
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Chamados no período",   len(df_ch_rel))
+        c2.metric("Atendimentos",          len(df_ret_rel))
+        c3.metric("Máquinas",              df_ch_rel[col_maquina].nunique() if col_maquina != "(nenhuma)" and not df_ch_rel.empty else 0)
+        c4.metric("Mecânicos",             df_ret_rel[col_mecanico].nunique() if col_mecanico != "(nenhuma)" and not df_ret_rel.empty else 0)
+
+        st.markdown("---")
+        if st.button("⬇ Gerar Relatório Mensal Excel", type="primary", use_container_width=True):
+            with st.spinner("Gerando relatório…"):
+                buf = gerar_excel_mensal(df_ch_rel, df_ret_rel, col_maquina, col_mecanico,
+                                         col_data_cham, col_data_ret, mes_rel, ano_rel, catalogo)
+            nome_mes_str = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"][mes_rel-1]
+            st.download_button(
+                label="📥 Baixar Excel",
+                data=buf,
+                file_name=f"PCM_MassaFest_{nome_mes_str}{ano_rel}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
+    else:  # PMs Preventivas
+        if df_prev.empty:
+            st.info("Configure a planilha de PMs preventivas no menu lateral para gerar este relatório.")
+        else:
+            pm_mes_cnt = len(df_prev[
+                (df_prev["Próxima_Execução"].dt.year  == ano_rel) &
+                (df_prev["Próxima_Execução"].dt.month == mes_rel)
+            ]) if "Próxima_Execução" in df_prev.columns else 0
+
+            st.metric("PMs programadas no período", pm_mes_cnt)
+            st.markdown("---")
+
+            if st.button("⬇ Gerar Relatório de PMs Excel", type="primary", use_container_width=True):
+                with st.spinner("Gerando relatório…"):
+                    buf = gerar_excel_preventiva(df_prev, mes_rel, ano_rel, catalogo)
+                nome_mes_str = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"][mes_rel-1]
+                st.download_button(
+                    label="📥 Baixar Excel",
+                    data=buf,
+                    file_name=f"PCM_MassaFest_Preventiva_{nome_mes_str}{ano_rel}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+
+
 # ABA 5: Dados Brutos
 # ─────────────────────────────────────────────
 with tab_dados:
