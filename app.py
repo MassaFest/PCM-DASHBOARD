@@ -417,6 +417,23 @@ def gerar_msg_telegram(row, antecedencia: int) -> str:
     )
 
 
+def _mask_preventiva(df_ch, col_tipo) -> "pd.Series":
+    """
+    Retorna máscara booleana para chamados preventivos.
+    Suporta dois formatos de coluna:
+      - Coluna de tipo livre: valores como 'Preventiva', 'Manutenção Preventiva'  → busca 'prev'
+      - Coluna yes/no ("Manutenção é preventiva?"): valores 'Sim', 'S', 'Yes'     → busca 'sim'|'yes'|^s$
+    """
+    col_nome_lower = col_tipo.lower()
+    vals = df_ch[col_tipo].astype(str).str.strip().str.lower()
+
+    # Se o próprio nome da coluna já diz "preventiva" e contém "?"  → é pergunta sim/não
+    if "preventiva" in col_nome_lower and ("?" in col_tipo or "é" in col_nome_lower):
+        return vals.str.contains(r"^sim$|^s$|^yes$|^y$|prev", na=False, regex=True)
+    else:
+        return vals.str.contains("prev", na=False)
+
+
 def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_data, col_mec, catalogo):
     """
     Mostra chamados marcados como 'preventiva' em ordem cronológica inversa.
@@ -428,7 +445,7 @@ def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_d
         st.warning("Configure a coluna **'Tipo Manutenção'** nos chamados (menu lateral → Colunas – Chamados) para usar esta função.")
         return
 
-    mask_prev = df_ch[col_tipo].astype(str).str.lower().str.contains("prev", na=False)
+    mask_prev = _mask_preventiva(df_ch, col_tipo)
     df_p = df_ch[mask_prev].copy()
 
     if df_p.empty:
@@ -503,7 +520,7 @@ def _gerar_importacao_historico(df_ch, col_tipo, col_maq, col_prob, col_data, co
         return
 
     # Filtra preventivas
-    mask_prev = df_ch[col_tipo].astype(str).str.lower().str.contains("prev", na=False)
+    mask_prev = _mask_preventiva(df_ch, col_tipo)
     df_prev_hist = df_ch[mask_prev].copy()
 
     if df_prev_hist.empty:
@@ -706,11 +723,13 @@ def col_select(label, df, default_hints, key):
 
 if not df_chamados.empty:
     col_data_cham   = col_select("Data/Hora",   df_chamados, ["timestamp","data","hora","abertura"], "c_data")
-    col_maquina     = col_select("Máquina",     df_chamados, ["maquina","máquina","equipamento","ativo"], "c_maq")
-    col_patrimonio  = col_select("Patrimônio",  df_chamados, ["patrimonio","patrimônio","tag","codigo"], "c_pat")
-    col_problema    = col_select("Problema",    df_chamados, ["problema","descricao","descri","falha","defeito"], "c_prob")
+    col_maquina     = col_select("Máquina / Patrimônio", df_chamados,
+                                 ["plaqueta","patrimonio","patrimônio","tag","codigo","maquina","máquina","equipamento","ativo"], "c_maq")
+    col_patrimonio  = col_select("Patrimônio (alt.)", df_chamados, ["patrimonio","patrimônio","tag","codigo"], "c_pat")
+    col_problema    = col_select("Problema",    df_chamados, ["problema","descricao","descri","falha","defeito","equipamento"], "c_prob")
     col_encarregado = col_select("Encarregado", df_chamados, ["encarregado","solicitante","abertura","nome"], "c_enc")
-    col_tipo_manut  = col_select("Tipo Manutenção", df_chamados, ["tipo","manutencao","manutenção","corretiva","preventiva"], "c_tipo")
+    col_tipo_manut  = col_select("Tipo Manutenção", df_chamados,
+                                 ["preventiva","tipo","manutencao","manutenção","corretiva"], "c_tipo")
 else:
     col_data_cham = col_maquina = col_patrimonio = col_problema = col_encarregado = col_tipo_manut = "(nenhuma)"
 
@@ -1167,11 +1186,14 @@ with tab_prev:
 
         # Taxa preventiva vs corretiva
         n_prev = 0; n_corr = 0
-        if not df_ch.empty:
+        if not df_ch.empty and col_tipo_manut != "(nenhuma)" and col_tipo_manut in df_ch.columns:
+            n_prev = int(_mask_preventiva(df_ch, col_tipo_manut).sum())
+            n_corr = len(df_ch) - n_prev
+        elif not df_ch.empty:
             for col in df_ch.columns:
                 if "tipo" in col.lower() or "manut" in col.lower():
-                    n_prev = df_ch[col].str.lower().str.contains("prev", na=False).sum()
-                    n_corr = df_ch[col].str.lower().str.contains("cor",  na=False).sum()
+                    n_prev = int(_mask_preventiva(df_ch, col).sum())
+                    n_corr = len(df_ch) - n_prev
                     break
         taxa = f"{n_prev/(n_prev+n_corr)*100:.0f}%" if (n_prev+n_corr) > 0 else "—"
 
