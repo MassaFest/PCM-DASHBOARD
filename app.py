@@ -513,6 +513,15 @@ def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_d
     if col_tipo_real != col_tipo:
         st.caption(f"ℹ️ Coluna detectada automaticamente: **{col_tipo_real}**")
 
+    # ── Diagnóstico (expander) ─────────────────────────────────────────────
+    with st.expander("🔍 Diagnóstico – clique para ver detalhes da detecção"):
+        st.write(f"**Coluna usada:** `{col_tipo_real}`")
+        st.write(f"**Total de chamados carregados:** {len(df_ch)}")
+        vals_unicos = df_ch[col_tipo_real].dropna().astype(str).str.strip().value_counts().head(10)
+        st.write("**Valores únicos nessa coluna (top 10):**")
+        st.dataframe(vals_unicos.reset_index().rename(columns={"index": "Valor", col_tipo_real: "Qtd"}),
+                     hide_index=True, use_container_width=False)
+
     mask_prev = _mask_preventiva(df_ch, col_tipo_real)
     df_p = df_ch[mask_prev].copy()
 
@@ -1257,7 +1266,8 @@ with tab_prev:
         st.markdown("---")
         _tab_a, _tab_b = st.tabs(["🆕 Novos Chamados", "📥 Importar do Histórico"])
         with _tab_a:
-            _painel_novos_chamados_preventivos(df_ch, col_tipo_manut, col_maquina, col_problema,
+            # Usa df_chamados SEM filtro de período — novos chamados não devem sumir por data
+            _painel_novos_chamados_preventivos(df_chamados, col_tipo_manut, col_maquina, col_problema,
                                                col_data_cham, col_mecanico, catalogo)
         with _tab_b:
             _gerar_importacao_historico(df_ch, col_tipo_manut, col_maquina, col_problema,
@@ -1304,7 +1314,8 @@ with tab_prev:
 
         # ── Novos chamados preventivos (principal novidade) ────────────────────
         with sub5:
-            _painel_novos_chamados_preventivos(df_ch, col_tipo_manut, col_maquina, col_problema,
+            # Usa df_chamados SEM filtro de período — novos chamados não devem sumir por data
+            _painel_novos_chamados_preventivos(df_chamados, col_tipo_manut, col_maquina, col_problema,
                                                col_data_cham, col_mecanico, catalogo)
 
         # ── Importar do histórico (agrupado por máquina) ───────────────────────
