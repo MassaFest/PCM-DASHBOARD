@@ -1141,23 +1141,23 @@ with tab_prev:
                 if not atras.empty:
                     st.error(f"### ⛔ {len(atras)} PM(s) Atrasada(s)")
                     cols_a = [c for c in ["Patrimônio","Tarefa","Última_Execução","Próxima_Execução","Dias_Restantes","Responsável","Prioridade"] if c in atras.columns]
-                    st.dataframe(atras[cols_a].sort_values("Dias_Restantes"), use_container_width=True, hide_index=True)
+                    atras_s = atras.sort_values("Dias_Restantes") if "Dias_Restantes" in atras.columns else atras
+                    st.dataframe(atras_s[cols_a], use_container_width=True, hide_index=True)
 
                 # Urgentes (dentro do prazo de antecedência)
                 urg = df_prev[(df_prev["Dias_Restantes"] >= 0) & (df_prev["Dias_Restantes"] <= antecedencia)].copy() if "Dias_Restantes" in df_prev.columns else pd.DataFrame()
                 if not urg.empty:
                     st.warning(f"### ⚠️ {len(urg)} PM(s) Vencendo em {antecedencia} dias")
                     cols_u = [c for c in ["Patrimônio","Tarefa","Próxima_Execução","Dias_Restantes","Responsável","Prioridade"] if c in urg.columns]
-                    st.dataframe(urg[cols_u].sort_values("Dias_Restantes"), use_container_width=True, hide_index=True)
+                    urg_s = urg.sort_values("Dias_Restantes") if "Dias_Restantes" in urg.columns else urg
+                    st.dataframe(urg_s[cols_u], use_container_width=True, hide_index=True)
 
                 # Todas as PMs com status
                 st.markdown("---")
                 st.subheader("📋 Todas as PMs")
                 cols_t = [c for c in ["Status","Patrimônio","Tarefa","Tipo","Frequência_Dias","Última_Execução","Próxima_Execução","Responsável","Prioridade","Observações"] if c in df_prev.columns]
-                st.dataframe(
-                    df_prev[cols_t].sort_values("Dias_Restantes") if "Dias_Restantes" in df_prev.columns else df_prev[cols_t],
-                    use_container_width=True, hide_index=True
-                )
+                df_prev_show = df_prev.sort_values("Dias_Restantes") if "Dias_Restantes" in df_prev.columns else df_prev
+                st.dataframe(df_prev_show[cols_t], use_container_width=True, hide_index=True)
 
         # ── Indicadores PCM ───────────────────────────────────────────────────
         with sub3:
