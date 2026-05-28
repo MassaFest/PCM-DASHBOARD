@@ -4,7 +4,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import requests
-from io import StringIO
+import re
+import unicodedata
+from io import StringIO, BytesIO
 
 st.set_page_config(
     page_title="PCM Dashboard",
@@ -17,6 +19,98 @@ DEFAULT_SHEET_CHAMADOS  = "1AJXsR6YpgSuYrDRo_vtNpsJtn0vSQ9ayjBX_4mMTtdw"
 DEFAULT_GID_CHAMADOS    = "2143366097"
 DEFAULT_SHEET_RETORNOS  = "1KO_U-Ly1s9rW2YuPdc48zwOcR6EuPf1CfBGbbSZMjEY"
 DEFAULT_GID_RETORNOS    = "824431047"
+DEFAULT_SHEET_CAT1      = "1gTmX6wTU2KBuI-dg2HHDTH-xTSNSkZXOUdQVpFmp-oo"
+DEFAULT_SHEET_CAT2      = "1bxr1yw-DcYrExfRpUYMEjf4CAm7uWe9zbDcTxB3wMfs"
+
+@st.cache_data(ttl=3600)
+def load_catalogo(sheet_id: str) -> tuple[dict, pd.DataFrame]:
+    """
+    Lê todas as abas de uma planilha de catálogo de máquinas.
+    Retorna:
+      - catalogo: dict {codigo_norm → {nome, localizacao}}
+      - historico: DataFrame com histórico legado de todas as máquinas
+    Estrutura esperada em cada aba:
+      Linha com 'Patrimônio' | 'Nome' | 'Localização'  (cabeçalho)
+      Próxima linha          | dados da máquina
+      ...
+      Linha com 'Data' | 'Tipo de manutenção' | ...    (cabeçalho histórico)
+      linhas de histórico...
+    """
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    catalogo  = {}
+    hist_rows = []
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        xls = pd.read_excel(BytesIO(resp.content), sheet_name=None, header=None)
+
+        for tab_name, df in xls.items():
+            df = df.fillna("").astype(str)
+            codigo_maq = nome_maq = local_maq = ""
+
+            # ── Procura linha de cabeçalho do cadastro ──────────────────────
+            for i, row in df.iterrows():
+                vals = [v.strip().lower() for v in row.values]
+                if any("patrim" in v for v in vals):
+                    if i + 1 < len(df):
+                        dr = df.iloc[i + 1]
+                        codigo_raw = dr.iloc[0].strip()
+                        nome_maq   = dr.iloc[1].strip() if len(dr) > 1 else ""
+                        local_maq  = dr.iloc[2].strip() if len(dr) > 2 else ""
+                        # Normaliza "MP 003" → "MP003"
+                        codigo_maq = re.sub(r'\s+', '', codigo_raw).upper()
+                    break
+
+            if not codigo_maq or not nome_maq or nome_maq.lower() in ("", "nan"):
+                continue
+
+            catalogo[codigo_maq] = {"nome": nome_maq, "localizacao": local_maq}
+
+            # ── Procura histórico de manutenção na mesma aba ────────────────
+            hist_start = None
+            for i, row in df.iterrows():
+                vals = [v.strip().lower() for v in row.values]
+                if any("data" in v for v in vals) and any("manuten" in v for v in vals):
+                    hist_start = i
+                    break
+
+            if hist_start is not None:
+                hist_df = df.iloc[hist_start:].copy()
+                hist_df.columns = range(len(hist_df.columns))
+                # Primeira linha vira cabeçalho
+                new_cols = [str(hist_df.iloc[0][c]).strip() for c in range(len(hist_df.columns))]
+                hist_df  = hist_df.iloc[1:].copy()
+                hist_df.columns = new_cols
+                hist_df = hist_df[hist_df.iloc[:, 0].str.strip().astype(bool)]  # remove vazios
+                hist_df = hist_df[~hist_df.iloc[:, 0].str.lower().str.contains("data")]
+
+                # Renomeia colunas para padrão
+                col_map = {}
+                for c in hist_df.columns:
+                    cl = c.lower()
+                    if "data"    in cl: col_map[c] = "Data/Hora"
+                    elif "tipo"  in cl: col_map[c] = "Tipo"
+                    elif "troca" in cl or "pec" in cl: col_map[c] = "Troca de Peça"
+                    elif "serv"  in cl or "realiz" in cl: col_map[c] = "Descrição"
+                    elif "custo" in cl or "r$" in cl: col_map[c] = "Custo"
+                hist_df = hist_df.rename(columns=col_map)
+                hist_df["Máquina"]  = codigo_maq
+                hist_df["Nome"]     = nome_maq
+                hist_df["Origem"]   = "Histórico Planilha"
+                if "Data/Hora" in hist_df.columns:
+                    hist_df["Data/Hora"] = pd.to_datetime(
+                        hist_df["Data/Hora"], dayfirst=True, errors="coerce"
+                    )
+                    hist_df = hist_df[hist_df["Data/Hora"].notna()]
+                hist_rows.append(hist_df)
+
+    except Exception as e:
+        st.warning(f"Catálogo ({sheet_id[:20]}…): {e}")
+
+    hist_legado = pd.concat(hist_rows, ignore_index=True) if hist_rows else pd.DataFrame()
+    return catalogo, hist_legado
+
 
 @st.cache_data(ttl=300)
 def load_sheet(sheet_id: str, gid: str) -> pd.DataFrame:
@@ -82,7 +176,16 @@ def normalizar_maquina(valor) -> str:
 
     # ── Legado: APENAS dígitos, 1 a 4 caracteres ────────────────────────────
     if re.fullmatch(r'\d{1,4}', v):
-        return v.zfill(3)
+        num_norm = v.zfill(3)
+        # Tenta converter para MP/PA via catálogo
+        try:
+            if num_norm in legacy_map:
+                return legacy_map[num_norm]
+            if v.lstrip('0') in legacy_map:
+                return legacy_map[v.lstrip('0')]
+        except NameError:
+            pass  # legacy_map ainda não carregado
+        return num_norm
 
     # ── Tudo o mais é inválido ───────────────────────────────────────────────
     return ""
@@ -213,11 +316,14 @@ with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3208/3208728.png", width=64)
     st.title("PCM Dashboard")
     st.markdown("---")
-    st.subheader("Planilhas")
+    st.subheader("Planilhas – Chamados/Retornos")
     sheet_chamados = st.text_input("ID – Chamados", DEFAULT_SHEET_CHAMADOS)
     gid_chamados   = st.text_input("GID – Chamados", DEFAULT_GID_CHAMADOS)
     sheet_retornos = st.text_input("ID – Retornos", DEFAULT_SHEET_RETORNOS)
     gid_retornos   = st.text_input("GID – Retornos", DEFAULT_GID_RETORNOS)
+    st.subheader("Catálogo de Máquinas")
+    sheet_cat1 = st.text_input("ID – Catálogo 1 (MP)", DEFAULT_SHEET_CAT1)
+    sheet_cat2 = st.text_input("ID – Catálogo 2 (PA)", DEFAULT_SHEET_CAT2)
     if st.button("🔄 Atualizar dados"):
         st.cache_data.clear()
     st.markdown("---")
@@ -234,6 +340,25 @@ with st.sidebar:
 with st.spinner("Carregando planilhas…"):
     df_chamados = load_sheet(sheet_chamados, gid_chamados)
     df_retornos = load_sheet(sheet_retornos, gid_retornos)
+
+with st.spinner("Carregando catálogo de máquinas…"):
+    cat1, hist_leg1 = load_catalogo(sheet_cat1)
+    cat2, hist_leg2 = load_catalogo(sheet_cat2)
+
+# Catálogo unificado: {codigo → {nome, localizacao}}
+catalogo = {**cat1, **cat2}
+
+# Histórico legado unificado
+hist_legado = pd.concat([hist_leg1, hist_leg2], ignore_index=True) if (not hist_leg1.empty or not hist_leg2.empty) else pd.DataFrame()
+
+# Mapa de conversão: número legado → código MP/PA
+# Ex: '003' → 'MP003', '045' → 'PA045'
+legacy_map = {}
+for cod in catalogo:
+    num = re.sub(r'[^0-9]', '', cod).lstrip('0')
+    if num:
+        legacy_map[num.zfill(3)] = cod
+        legacy_map[num]          = cod
 
 if df_chamados.empty and df_retornos.empty:
     st.warning("Nenhum dado encontrado. Verifique se as planilhas estão públicas.")
@@ -358,6 +483,13 @@ df_ret = filter_df(df_retornos, col_data_ret,  maq_col_ret, col_mecanico if col_
 # DASHBOARD PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 st.title("🔧 PCM – Painel de Manutenção")
+
+def nome_maquina(codigo: str) -> str:
+    """Retorna 'MP003 – MÁQUINA DE CORTE' ou só o código se não encontrar."""
+    info = catalogo.get(str(codigo).strip().upper())
+    if info and info.get("nome"):
+        return f"{codigo} – {info['nome'].title()}"
+    return str(codigo)
 
 tab_visao, tab_mecanico, tab_maquina, tab_historico, tab_dados = st.tabs([
     "📊 Visão Geral", "👷 Por Mecânico", "🏭 Por Máquina", "📋 Histórico", "📂 Dados Brutos"
@@ -572,12 +704,18 @@ with tab_historico:
                 subset = subset.drop(columns=["Tempo_min"])
             hist_rows.append(subset)
 
+        # Inclui histórico legado da planilha de cadastro
+        if not hist_legado.empty and "Máquina" in hist_legado.columns:
+            leg_maq = hist_legado[hist_legado["Máquina"] == maq_sel].copy()
+            if not leg_maq.empty:
+                hist_rows.append(leg_maq)
+
         if hist_rows:
             hist = pd.concat(hist_rows, ignore_index=True)
             if "Data/Hora" in hist.columns:
                 hist = hist.sort_values("Data/Hora", ascending=False)
 
-            cols_show = [c for c in ["Data/Hora","Origem","Descrição","Mecânico","Tempo de Atendimento","Encarregado","Status"] if c in hist.columns]
+            cols_show = [c for c in ["Data/Hora","Origem","Tipo","Descrição","Troca de Peça","Mecânico","Tempo de Atendimento","Encarregado","Status","Custo"] if c in hist.columns]
             st.dataframe(hist[cols_show], use_container_width=True, hide_index=True)
 
             # Métricas rápidas
