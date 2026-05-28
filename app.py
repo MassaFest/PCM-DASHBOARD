@@ -737,7 +737,9 @@ else:
     min_date = datetime.today().date() - timedelta(days=365)
     max_date = datetime.today().date()
 
-periodo = st.sidebar.date_input("Período", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+hoje = datetime.today().date()
+max_val = max(max_date, hoje)
+periodo = st.sidebar.date_input("Período", value=(min_date, hoje), min_value=min_date, max_value=max_val)
 if len(periodo) == 2:
     dt_ini, dt_fim = pd.Timestamp(periodo[0]), pd.Timestamp(periodo[1]) + timedelta(days=1)
 else:
