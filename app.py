@@ -40,18 +40,58 @@ def limpar_nome_mecanico(valor: str) -> str:
     import re
     if not isinstance(valor, str):
         return valor
-    nome = re.sub(r'^\d+\s*', '', valor.strip())
-    nome = re.sub(r'\s*\d+$', '', nome)
-    nome = re.sub(r'\d+', '', nome)
+    nome = re.sub(r'^\d+\s*', '', valor.strip())   # números no início
+    nome = re.sub(r'\s*\d+$', '', nome)              # números no fim
+    nome = re.sub(r'\d+', '', nome)                  # números no meio
     nome = nome.strip().title()
-    return nome if nome else valor
+    return nome if nome else ""
 
-def agrupar_nomes_similares(series: pd.Series, threshold: float = 0.80) -> pd.Series:
+def expandir_mecanicos(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """
+    Linhas com múltiplos mecânicos ("Lucas/Janailson", "Alexandre E Lucas")
+    são expandidas: cada mecânico recebe uma linha individual.
+    Linhas cujo valor seja apenas número (ex: "1950") são descartadas.
+    """
+    import re
+    if col not in df.columns:
+        return df
+
+    linhas = []
+    for _, row in df.iterrows():
+        val = row[col]
+        if not isinstance(val, str) or not val.strip():
+            linhas.append(row)
+            continue
+
+        # Separadores: / | e | E | & | , | + (com ou sem espaços)
+        partes = re.split(r'\s*/\s*|\s+[eE&]\s+|\s*,\s*|\s*\+\s*|\s*\|\s*', val)
+        partes = [limpar_nome_mecanico(p) for p in partes]
+        # Remove vazios e entradas que são só números
+        partes = [p for p in partes if p and not re.fullmatch(r'\d+', p.strip())]
+
+        if not partes:
+            continue  # descarta linha sem nome válido
+
+        for nome in partes:
+            nova = row.copy()
+            nova[col] = nome
+            linhas.append(nova)
+
+    return pd.DataFrame(linhas, columns=df.columns).reset_index(drop=True)
+
+def agrupar_nomes_similares(series: pd.Series, threshold: float = 0.75) -> pd.Series:
+    """
+    Agrupa nomes parecidos (erros de digitação, variações) num único nome canônico.
+    O nome canônico é o mais frequente do grupo.
+    Ex: ['Alexandre','Alexadre','Alexander'] → todos viram 'Alexandre'
+    """
     from difflib import SequenceMatcher
+
     contagem = series.value_counts()
     nomes    = list(contagem.index)
-    mapa     = {}
+    mapa     = {}           # nome original → nome canônico
     visitado = set()
+
     for i, n1 in enumerate(nomes):
         if n1 in visitado:
             continue
@@ -63,13 +103,17 @@ def agrupar_nomes_similares(series: pd.Series, threshold: float = 0.80) -> pd.Se
             if ratio >= threshold:
                 grupo.append(n2)
                 visitado.add(n2)
+        # Canônico = o mais frequente do grupo
         canonico = max(grupo, key=lambda n: contagem.get(n, 0))
         for n in grupo:
             mapa[n] = canonico
         visitado.add(n1)
+
     return series.map(lambda x: mapa.get(x, x) if isinstance(x, str) else x)
 
+
 def formatar_tempo(minutos):
+    """Formata minutos em texto legível: ex. 1h 30min"""
     if pd.isna(minutos) or minutos < 0:
         return "—"
     h = int(minutos // 60)
@@ -82,17 +126,26 @@ def formatar_tempo(minutos):
         return f"{m}min"
 
 def calcular_tempos(df_ch, df_ret, col_data_cham, col_maquina, col_data_ret, maq_col_ret):
+    """
+    Para cada retorno, busca o chamado mais recente da mesma máquina
+    ANTES da data do retorno e calcula o tempo de resposta em minutos.
+    Retorna df_ret com coluna 'Tempo_min' adicionada.
+    """
     if (df_ch.empty or df_ret.empty
             or col_data_cham == "(nenhuma)" or col_maquina == "(nenhuma)"
             or col_data_ret == "(nenhuma)" or not maq_col_ret):
         return df_ret
+
     df_ret = df_ret.copy()
     df_ret["Tempo_min"] = None
+
     for idx, row_ret in df_ret.iterrows():
-        maq    = row_ret.get(maq_col_ret)
+        maq   = row_ret.get(maq_col_ret)
         dt_ret = row_ret.get(col_data_ret)
         if pd.isna(maq) or pd.isna(dt_ret):
             continue
+
+        # Chamados da mesma máquina, anteriores ao retorno
         mask = (
             (df_ch[col_maquina] == maq) &
             (df_ch[col_data_cham] <= dt_ret)
@@ -100,12 +153,18 @@ def calcular_tempos(df_ch, df_ret, col_data_cham, col_maquina, col_data_ret, maq
         candidatos = df_ch.loc[mask, col_data_cham].dropna()
         if candidatos.empty:
             continue
-        dt_cham   = candidatos.max()
+
+        # Pega o mais próximo (mais recente)
+        dt_cham = candidatos.max()
         delta_min = (dt_ret - dt_cham).total_seconds() / 60
+
+        # Descarta valores negativos ou absurdos (> 30 dias)
         if 0 < delta_min <= 43200:
             df_ret.at[idx, "Tempo_min"] = delta_min
+
     df_ret["Tempo_min"] = pd.to_numeric(df_ret["Tempo_min"], errors="coerce")
     return df_ret
+
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -126,7 +185,7 @@ with st.sidebar:
         min_value=0.50, max_value=1.00, value=0.80, step=0.05,
         help="Quanto menor, mais nomes são agrupados. 0.80 é o recomendado."
     )
-    st.caption("Agrupa variações como 'Alexandre' e 'Alexadre' automaticamente.")
+    st.caption("Agrupa automaticamente variações como 'Alexandre' e 'Alexadre'.")
     st.markdown("---")
     st.caption("Dados atualizados a cada 5 min automaticamente.")
 
@@ -172,7 +231,9 @@ if not df_chamados.empty and col_data_cham != "(nenhuma)":
 if not df_retornos.empty and col_data_ret != "(nenhuma)":
     df_retornos = parse_date_col(df_retornos, col_data_ret)
 if not df_retornos.empty and col_mecanico != "(nenhuma)" and col_mecanico in df_retornos.columns:
-    df_retornos[col_mecanico] = df_retornos[col_mecanico].apply(limpar_nome_mecanico)
+    # 1. Expande duplas/trios → cada mecânico vira uma linha separada
+    df_retornos = expandir_mecanicos(df_retornos, col_mecanico)
+    # 2. Agrupa nomes similares (erros de digitação)
     df_retornos[col_mecanico] = agrupar_nomes_similares(df_retornos[col_mecanico], threshold=similaridade)
 
 maq_col_ret = col_maq_ret if col_maq_ret != "(nenhuma)" else None
@@ -231,12 +292,17 @@ df_ch  = filter_df(df_chamados, col_data_cham, col_maquina if col_maquina != "(n
 df_ret = filter_df(df_retornos, col_data_ret,  maq_col_ret, col_mecanico if col_mecanico != "(nenhuma)" else None)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════════
 st.title("🔧 PCM – Painel de Manutenção")
 
 tab_visao, tab_mecanico, tab_maquina, tab_historico, tab_dados = st.tabs([
     "📊 Visão Geral", "👷 Por Mecânico", "🏭 Por Máquina", "📋 Histórico", "📂 Dados Brutos"
 ])
 
+# ─────────────────────────────────────────────
+# ABA 1: Visão Geral
+# ─────────────────────────────────────────────
 with tab_visao:
     c1, c2, c3, c4, c5 = st.columns(5)
     total_chamados  = len(df_ch)
@@ -246,14 +312,21 @@ with tab_visao:
         (list(df_ret[maq_col_ret].dropna()) if maq_col_ret and not df_ret.empty else [])
     ))
     total_mecanicos = df_ret[col_mecanico].nunique() if col_mecanico != "(nenhuma)" and not df_ret.empty else 0
-    tempo_medio_geral = df_ret["Tempo_min"].dropna().mean() if "Tempo_min" in df_ret.columns else None
+
+    tempo_medio_geral = None
+    if "Tempo_min" in df_ret.columns:
+        tempo_medio_geral = df_ret["Tempo_min"].dropna().mean()
+
     c1.metric("Total de Chamados", total_chamados)
     c2.metric("Atendimentos Realizados", total_retornos)
     c3.metric("Máquinas Atendidas", total_maquinas)
     c4.metric("Mecânicos Ativos", total_mecanicos)
-    c5.metric("Tempo Médio de Atendimento", formatar_tempo(tempo_medio_geral) if tempo_medio_geral else "—")
+    c5.metric("Tempo Médio de Atendimento",
+              formatar_tempo(tempo_medio_geral) if tempo_medio_geral else "—")
+
     st.markdown("---")
     col_l, col_r = st.columns(2)
+
     with col_l:
         st.subheader("Chamados ao longo do tempo")
         if not df_ch.empty and col_data_cham != "(nenhuma)":
@@ -265,6 +338,7 @@ with tab_visao:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Configure a coluna de data dos chamados no menu lateral.")
+
     with col_r:
         st.subheader("Atendimentos por mecânico")
         if not df_ret.empty and col_mecanico != "(nenhuma)":
@@ -277,6 +351,9 @@ with tab_visao:
         else:
             st.info("Configure a coluna de mecânico no menu lateral.")
 
+# ─────────────────────────────────────────────
+# ABA 2: Por Mecânico
+# ─────────────────────────────────────────────
 with tab_mecanico:
     st.subheader("Desempenho por Mecânico")
     if df_ret.empty or col_mecanico == "(nenhuma)":
@@ -285,12 +362,15 @@ with tab_mecanico:
         mec_df = df_ret[col_mecanico].value_counts().reset_index()
         mec_df.columns = ["Mecânico", "Atendimentos"]
         mec_df["% do Total"] = (mec_df["Atendimentos"] / mec_df["Atendimentos"].sum() * 100).round(1)
+
+        # Adiciona tempo médio por mecânico se disponível
         if "Tempo_min" in df_ret.columns:
             tempo_mec = df_ret.groupby(col_mecanico)["Tempo_min"].mean().reset_index()
             tempo_mec.columns = ["Mecânico", "Tempo_Médio_min"]
             mec_df = mec_df.merge(tempo_mec, on="Mecânico", how="left")
             mec_df["Tempo Médio"] = mec_df["Tempo_Médio_min"].apply(formatar_tempo)
             mec_df = mec_df.drop(columns=["Tempo_Médio_min"])
+
         col_a, col_b = st.columns([1, 2])
         with col_a:
             st.dataframe(mec_df, use_container_width=True, hide_index=True)
@@ -300,6 +380,7 @@ with tab_mecanico:
                          color_discrete_sequence=px.colors.qualitative.Set2)
             fig.update_traces(textposition="inside", textinfo="percent+label")
             st.plotly_chart(fig, use_container_width=True)
+
         if col_data_ret != "(nenhuma)":
             st.markdown("---")
             st.subheader("Evolução mensal por mecânico")
@@ -310,10 +391,14 @@ with tab_mecanico:
             fig2.update_layout(xaxis_tickangle=-45)
             st.plotly_chart(fig2, use_container_width=True)
 
+# ─────────────────────────────────────────────
+# ABA 3: Por Máquina
+# ─────────────────────────────────────────────
 with tab_maquina:
     st.subheader("Máquinas com mais manutenção")
     maq_src_col = col_maquina if (col_maquina != "(nenhuma)" and not df_ch.empty) else None
     maq_ret_col = maq_col_ret if (maq_col_ret and not df_ret.empty) else None
+
     frames = []
     if maq_src_col:
         c = df_ch[maq_src_col].value_counts().reset_index()
@@ -323,23 +408,33 @@ with tab_maquina:
         c = df_ret[maq_ret_col].value_counts().reset_index()
         c.columns = ["Máquina", "Atendimentos"]
         frames.append(c.set_index("Máquina"))
+
+    # Tempo de manutenção por máquina
     if maq_ret_col and "Tempo_min" in df_ret.columns:
         t = df_ret.groupby(maq_ret_col)["Tempo_min"].agg(
-            Tempo_Médio_min="mean", Tempo_Total_min="sum", Tempo_Máximo_min="max"
+            Tempo_Médio_min="mean",
+            Tempo_Total_min="sum",
+            Tempo_Máximo_min="max"
         ).reset_index()
         t.columns = ["Máquina", "Tempo_Médio_min", "Tempo_Total_min", "Tempo_Máximo_min"]
         frames.append(t.set_index("Máquina"))
+
     if frames:
         maq_df = pd.concat(frames, axis=1).reset_index()
+
+        # Formata colunas de tempo
         for col_t in ["Tempo_Médio_min", "Tempo_Total_min", "Tempo_Máximo_min"]:
             if col_t in maq_df.columns:
                 label = col_t.replace("_min","").replace("_"," ")
                 maq_df[label] = maq_df[col_t].apply(formatar_tempo)
                 maq_df = maq_df.drop(columns=[col_t])
+
+        # Coluna total de ocorrências
         num_cols = [c for c in ["Chamados","Atendimentos"] if c in maq_df.columns]
         if num_cols:
             maq_df["Total"] = maq_df[num_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
             maq_df = maq_df.sort_values("Total", ascending=False)
+
         col_t, col_g = st.columns([1, 2])
         with col_t:
             st.dataframe(maq_df.fillna("—"), use_container_width=True, hide_index=True)
@@ -350,6 +445,8 @@ with tab_maquina:
                              color="Total", color_continuous_scale="Reds")
                 fig.update_layout(xaxis_tickangle=-45)
                 st.plotly_chart(fig, use_container_width=True)
+
+        # Gráfico de tempo médio por máquina
         if "Tempo Médio" in maq_df.columns and maq_ret_col and "Tempo_min" in df_ret.columns:
             st.markdown("---")
             st.subheader("⏱ Tempo médio de atendimento por máquina")
@@ -357,7 +454,8 @@ with tab_maquina:
             tempo_graf.columns = ["Máquina", "Minutos"]
             tempo_graf = tempo_graf.dropna().sort_values("Minutos", ascending=False).head(20)
             tempo_graf["Tempo"] = tempo_graf["Minutos"].apply(formatar_tempo)
-            fig3 = px.bar(tempo_graf, x="Máquina", y="Minutos", text="Tempo",
+            fig3 = px.bar(tempo_graf, x="Máquina", y="Minutos",
+                          text="Tempo",
                           title="Top 20 – Maior tempo médio de atendimento",
                           color="Minutos", color_continuous_scale="Oranges")
             fig3.update_traces(textposition="outside")
@@ -366,6 +464,9 @@ with tab_maquina:
     else:
         st.info("Configure as colunas de máquina no menu lateral.")
 
+# ─────────────────────────────────────────────
+# ABA 4: Histórico por Máquina
+# ─────────────────────────────────────────────
 with tab_historico:
     st.subheader("Histórico de manutenção por máquina")
     maquinas_disp = []
@@ -374,11 +475,13 @@ with tab_historico:
     if maq_ret_col:
         maquinas_disp += df_ret[maq_ret_col].dropna().unique().tolist()
     maquinas_disp = sorted(set(maquinas_disp))
+
     if not maquinas_disp:
         st.info("Nenhuma máquina encontrada. Configure as colunas no menu lateral.")
     else:
         maq_sel = st.selectbox("Selecione a máquina", maquinas_disp)
         hist_rows = []
+
         if maq_src_col and not df_ch.empty:
             subset = df_ch[df_ch[maq_src_col] == maq_sel].copy()
             subset["Origem"] = "Chamado"
@@ -388,6 +491,7 @@ with tab_historico:
             if col_encarregado != "(nenhuma)": rename[col_encarregado] = "Encarregado"
             subset = subset.rename(columns=rename)
             hist_rows.append(subset)
+
         if maq_ret_col and not df_ret.empty:
             subset = df_ret[df_ret[maq_ret_col] == maq_sel].copy()
             subset["Origem"] = "Atendimento"
@@ -401,24 +505,31 @@ with tab_historico:
                 subset["Tempo de Atendimento"] = subset["Tempo_min"].apply(formatar_tempo)
                 subset = subset.drop(columns=["Tempo_min"])
             hist_rows.append(subset)
+
         if hist_rows:
             hist = pd.concat(hist_rows, ignore_index=True)
             if "Data/Hora" in hist.columns:
                 hist = hist.sort_values("Data/Hora", ascending=False)
+
             cols_show = [c for c in ["Data/Hora","Origem","Descrição","Mecânico","Tempo de Atendimento","Encarregado","Status"] if c in hist.columns]
             st.dataframe(hist[cols_show], use_container_width=True, hide_index=True)
+
+            # Métricas rápidas
             m1, m2, m3 = st.columns(3)
             m1.metric("Total de ocorrências", len(hist))
             if "Mecânico" in hist.columns:
                 top_mec = hist["Mecânico"].value_counts().idxmax() if not hist["Mecânico"].isna().all() else "—"
                 m2.metric("Mecânico que mais atendeu", top_mec)
-            if maq_ret_col and "Tempo_min" in df_ret.columns:
+            if "Tempo de Atendimento" in hist.columns and maq_ret_col and "Tempo_min" in df_ret.columns:
                 subset_t = df_ret[df_ret[maq_ret_col] == maq_sel]["Tempo_min"].dropna()
                 if not subset_t.empty:
                     m3.metric("Tempo médio nesta máquina", formatar_tempo(subset_t.mean()))
         else:
             st.info("Nenhum registro encontrado para esta máquina no período selecionado.")
 
+# ─────────────────────────────────────────────
+# ABA 5: Dados Brutos
+# ─────────────────────────────────────────────
 with tab_dados:
     st.subheader("Dados brutos")
     aba = st.radio("Planilha", ["Chamados", "Retornos"], horizontal=True)
