@@ -1131,22 +1131,64 @@ with tab_mecanico:
 # ─────────────────────────────────────────────
 with tab_maquina:
     st.subheader("Máquinas com mais manutenção")
-    maq_src_col = col_maquina if (col_maquina != "(nenhuma)" and not df_ch.empty) else None
-    maq_ret_col = maq_col_ret if (maq_col_ret and not df_ret.empty) else None
+
+    # ── Filtro de período próprio desta aba ────────────────────────────────
+    _hoje = datetime.today().date()
+    _pm_fa, _pm_fb, _pm_fc, _pm_fd = st.columns([1, 1, 1, 3])
+    with _pm_fa:
+        if st.button("📅 Hoje",   key="maq_hoje"):   st.session_state["maq_p"] = (_hoje, _hoje)
+    with _pm_fb:
+        if st.button("📅 7 dias", key="maq_7d"):
+            st.session_state["maq_p"] = (_hoje - timedelta(days=6), _hoje)
+    with _pm_fc:
+        if st.button("📅 30 dias",key="maq_30d"):
+            st.session_state["maq_p"] = (_hoje - timedelta(days=29), _hoje)
+    with _pm_fd:
+        _default_range = st.session_state.get("maq_p", (dt_ini.date(), dt_fim.date()))
+        _maq_periodo = st.date_input(
+            "Período personalizado",
+            value=_default_range,
+            key="maq_periodo_input",
+            label_visibility="collapsed"
+        )
+        if isinstance(_maq_periodo, (list, tuple)) and len(_maq_periodo) == 2:
+            st.session_state["maq_p"] = (_maq_periodo[0], _maq_periodo[1])
+
+    _p = st.session_state.get("maq_p", (dt_ini.date(), dt_fim.date()))
+    _maq_ini = pd.Timestamp(_p[0])
+    _maq_fim = pd.Timestamp(_p[1]) + timedelta(days=1)
+
+    # Aplica filtro de período nos dados desta aba
+    df_ch_m = df_ch.copy()
+    df_ret_m = df_ret.copy()
+    if col_data_cham != "(nenhuma)" and col_data_cham in df_ch_m.columns:
+        df_ch_m = df_ch_m[(df_ch_m[col_data_cham] >= _maq_ini) & (df_ch_m[col_data_cham] < _maq_fim)]
+    if col_data_ret != "(nenhuma)" and col_data_ret in df_ret_m.columns:
+        df_ret_m = df_ret_m[(df_ret_m[col_data_ret] >= _maq_ini) & (df_ret_m[col_data_ret] < _maq_fim)]
+
+    # Recalcula MTBF/MTTR para o período selecionado
+    df_mtbf_m = calcular_mtbf_mttr(df_ch_m, df_ret_m, col_data_cham, col_maquina, col_data_ret, maq_col_ret)
+
+    st.caption(f"Período: **{_p[0].strftime('%d/%m/%Y')}** a **{_p[1].strftime('%d/%m/%Y')}** — "
+               f"{len(df_ch_m)} chamados · {len(df_ret_m)} atendimentos")
+    st.markdown("---")
+
+    maq_src_col = col_maquina if (col_maquina != "(nenhuma)" and not df_ch_m.empty) else None
+    maq_ret_col = maq_col_ret if (maq_col_ret and not df_ret_m.empty) else None
 
     frames = []
     if maq_src_col:
-        c = df_ch[maq_src_col].value_counts().reset_index()
+        c = df_ch_m[maq_src_col].value_counts().reset_index()
         c.columns = ["Máquina", "Chamados"]
         frames.append(c.set_index("Máquina"))
     if maq_ret_col:
-        c = df_ret[maq_ret_col].value_counts().reset_index()
+        c = df_ret_m[maq_ret_col].value_counts().reset_index()
         c.columns = ["Máquina", "Atendimentos"]
         frames.append(c.set_index("Máquina"))
 
     # Tempo de manutenção por máquina
-    if maq_ret_col and "Tempo_min" in df_ret.columns:
-        t = df_ret.groupby(maq_ret_col)["Tempo_min"].agg(
+    if maq_ret_col and "Tempo_min" in df_ret_m.columns:
+        t = df_ret_m.groupby(maq_ret_col)["Tempo_min"].agg(
             Tempo_Médio_min="mean",
             Tempo_Total_min="sum",
             Tempo_Máximo_min="max"
@@ -1185,10 +1227,10 @@ with tab_maquina:
                 st.plotly_chart(fig, use_container_width=True)
 
         # Gráfico de tempo médio por máquina
-        if "Tempo Médio" in maq_df.columns and maq_ret_col and "Tempo_min" in df_ret.columns:
+        if "Tempo Médio" in maq_df.columns and maq_ret_col and "Tempo_min" in df_ret_m.columns:
             st.markdown("---")
             st.subheader("⏱ Tempo médio de atendimento por máquina")
-            tempo_graf = df_ret.groupby(maq_ret_col)["Tempo_min"].mean().reset_index()
+            tempo_graf = df_ret_m.groupby(maq_ret_col)["Tempo_min"].mean().reset_index()
             tempo_graf.columns = ["Máquina", "Minutos"]
             tempo_graf = tempo_graf.dropna().sort_values("Minutos", ascending=False).head(20)
             tempo_graf["Tempo"] = tempo_graf["Minutos"].apply(formatar_tempo)
@@ -1199,6 +1241,19 @@ with tab_maquina:
             fig3.update_traces(textposition="outside")
             fig3.update_layout(xaxis_tickangle=-45, yaxis_title="Minutos")
             st.plotly_chart(fig3, use_container_width=True)
+
+        # ── Paradas por dia no período ──────────────────────────────────────
+        if maq_src_col and col_data_cham != "(nenhuma)" and col_data_cham in df_ch_m.columns:
+            st.markdown("---")
+            st.subheader("📆 Paradas por dia")
+            df_dia = df_ch_m.copy()
+            df_dia["Dia"] = df_ch_m[col_data_cham].dt.date
+            paradas_dia = df_dia.groupby("Dia").size().reset_index(name="Paradas")
+            fig_dia = px.bar(paradas_dia, x="Dia", y="Paradas",
+                             title="Número de chamados por dia no período",
+                             color="Paradas", color_continuous_scale=ESCALA_CALOR)
+            fig_dia.update_layout(xaxis_title="Data", yaxis_title="Chamados")
+            st.plotly_chart(fig_dia, use_container_width=True)
     else:
         st.info("Configure as colunas de máquina no menu lateral.")
 
@@ -1422,9 +1477,9 @@ with tab_prev:
 
             with col_i1:
                 # MTBF por máquina
-                if not df_mtbf.empty and "MTBF_h" in df_mtbf.columns:
+                if not df_mtbf_m.empty and "MTBF_h" in df_mtbf_m.columns:
                     st.markdown("#### ⏳ MTBF – Tempo Médio Entre Falhas")
-                    mtbf_df = df_mtbf[["Máquina","MTBF_h"]].dropna().sort_values("MTBF_h")
+                    mtbf_df = df_mtbf_m[["Máquina","MTBF_h"]].dropna().sort_values("MTBF_h")
                     mtbf_df["MTBF"] = mtbf_df["MTBF_h"].apply(
                         lambda h: f"{int(h//24)}d {int(h%24)}h" if h >= 24 else f"{int(h)}h"
                     )
@@ -1440,9 +1495,9 @@ with tab_prev:
 
             with col_i2:
                 # MTTR por máquina
-                if not df_mtbf.empty and "MTTR_min" in df_mtbf.columns:
+                if not df_mtbf_m.empty and "MTTR_min" in df_mtbf_m.columns:
                     st.markdown("#### 🔧 MTTR – Tempo Médio de Reparo")
-                    mttr_df = df_mtbf[["Máquina","MTTR_min"]].dropna().sort_values("MTTR_min", ascending=False)
+                    mttr_df = df_mtbf_m[["Máquina","MTTR_min"]].dropna().sort_values("MTTR_min", ascending=False)
                     mttr_df["MTTR"] = mttr_df["MTTR_min"].apply(formatar_tempo)
                     fig_mttr = px.bar(mttr_df.head(20), x="MTTR_min", y="Máquina",
                                       orientation="h", text="MTTR",
