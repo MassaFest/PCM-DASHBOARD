@@ -528,13 +528,18 @@ def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_d
         st.info("✅ Nenhum chamado do tipo 'preventiva' encontrado. Tudo em dia!")
         return
 
-    # Auto-detecta coluna de patrimônio: prefere coluna com código (MP/PA + números)
+    # Auto-detecta coluna de patrimônio — varre TODAS as colunas procurando MP/PA + números
     col_pat_auto = col_maq
-    for _c in df_p.columns:
-        _c_l = _c.lower()
-        if any(k in _c_l for k in ("plaqueta", "patrimônio", "patrimonio", "tag", "codigo", "código")):
-            _sample = df_p[_c].dropna().astype(str).head(20)
-            if _sample.str.contains(r"^(MP|PA|mp|pa)\d+$", regex=True).any():
+    for _c in df_ch.columns:   # usa df_ch completo para ter mais amostras
+        _sample = df_ch[_c].dropna().astype(str).str.strip().head(30)
+        if _sample.str.match(r"^(MP|PA)\d+$", na=False).sum() >= 1:
+            col_pat_auto = _c
+            break
+    # Se não achou MP/PA, tenta coluna com "plaqueta"/"patrimônio" no nome
+    if col_pat_auto == col_maq:
+        for _c in df_ch.columns:
+            _c_ascii = _ascii_lower(_c)
+            if any(k in _c_ascii for k in ("plaqueta", "patrimonio", "tag")):
                 col_pat_auto = _c
                 break
 
@@ -847,6 +852,9 @@ if not df_retornos.empty and col_mecanico != "(nenhuma)" and col_mecanico in df_
     df_retornos[col_mecanico] = agrupar_nomes_similares(df_retornos[col_mecanico], threshold=similaridade)
 
 maq_col_ret = col_maq_ret if col_maq_ret != "(nenhuma)" else None
+
+# ── Salva cópia ANTES da normalização (para uso em Novos Chamados Preventivos) ──
+df_chamados_full = df_chamados.copy()
 
 # ── Normalizar máquinas ────────────────────────────────────────────────────────
 for _df, _col in [(df_chamados, col_maquina), (df_retornos, maq_col_ret)]:
@@ -1265,8 +1273,8 @@ with tab_prev:
         st.markdown("---")
         _tab_a, _tab_b = st.tabs(["🆕 Novos Chamados", "📥 Importar do Histórico"])
         with _tab_a:
-            # Usa df_chamados SEM filtro de período — novos chamados não devem sumir por data
-            _painel_novos_chamados_preventivos(df_chamados, col_tipo_manut, col_maquina, col_problema,
+            # Usa df_chamados_full (antes da normalização) SEM filtro de período
+            _painel_novos_chamados_preventivos(df_chamados_full, col_tipo_manut, col_maquina, col_problema,
                                                col_data_cham, col_mecanico, catalogo)
         with _tab_b:
             _gerar_importacao_historico(df_ch, col_tipo_manut, col_maquina, col_problema,
@@ -1313,8 +1321,8 @@ with tab_prev:
 
         # ── Novos chamados preventivos (principal novidade) ────────────────────
         with sub5:
-            # Usa df_chamados SEM filtro de período — novos chamados não devem sumir por data
-            _painel_novos_chamados_preventivos(df_chamados, col_tipo_manut, col_maquina, col_problema,
+            # Usa df_chamados_full (antes da normalização) SEM filtro de período
+            _painel_novos_chamados_preventivos(df_chamados_full, col_tipo_manut, col_maquina, col_problema,
                                                col_data_cham, col_mecanico, catalogo)
 
         # ── Importar do histórico (agrupado por máquina) ───────────────────────
