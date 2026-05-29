@@ -141,6 +141,34 @@ def parse_date_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
         df[col] = pd.to_datetime(df[col], dayfirst=True, errors="coerce")
     return df
 
+def _parse_hora(valor, dt_ref) -> "pd.Timestamp | None":
+    """
+    Converte um valor de hora para Timestamp.
+    Aceita:
+      - Datetime completo ("29/05/2026 09:30:00") → retorna direto
+      - Hora apenas ("09:30" ou "09:30:00")       → combina com a data de dt_ref
+    Retorna None se não conseguir parsear.
+    """
+    import re as _re
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return None
+    s = str(valor).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return None
+    # Tenta datetime completo primeiro
+    dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+    if pd.notna(dt) and dt.year > 1970:
+        return dt
+    # Tenta hora isolada: HH:MM ou HH:MM:SS
+    m = _re.match(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?$', s)
+    if m and pd.notna(dt_ref):
+        h  = int(m.group(1))
+        mi = int(m.group(2))
+        sc = int(m.group(3) or 0)
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return dt_ref.replace(hour=h, minute=mi, second=sc, microsecond=0)
+    return None
+
 def limpar_nome_mecanico(valor: str) -> str:
     import re
     if not isinstance(valor, str):
@@ -281,27 +309,70 @@ def formatar_tempo(minutos):
     else:
         return f"{m}min"
 
-def calcular_tempos(df_ch, df_ret, col_data_cham, col_maquina, col_data_ret, maq_col_ret):
+def calcular_tempos(df_ch, df_ret, col_data_cham, col_maquina, col_data_ret, maq_col_ret,
+                    col_hora_ini=None, col_hora_fim=None):
     """
-    Para cada retorno, busca o chamado mais recente da mesma máquina
-    ANTES da data do retorno e calcula o tempo de resposta em minutos.
-    Retorna df_ret com coluna 'Tempo_min' adicionada.
+    Para cada retorno calcula o tempo de atendimento em minutos (inteiro).
+
+    Modo preciso (preferencial) — usa colunas de hora do retorno:
+      • col_hora_ini: hora em que o mecânico INICIOU o atendimento
+      • col_hora_fim: hora em que o mecânico CONCLUIU o atendimento
+      Aceita "HH:MM", "HH:MM:SS" ou datetime completo.
+      Se apenas col_hora_fim for informada, calcula desde o chamado → conclusão.
+      Se ambas forem informadas, calcula somente o tempo de execução (ignora espera).
+
+    Modo fallback — sem colunas de hora:
+      Busca o chamado mais recente da mesma máquina antes do retorno e mede
+      do timestamp do chamado até o timestamp de envio do retorno.
+      (Inclui espera + execução + tempo de preenchimento do formulário.)
     """
     if (df_ch.empty or df_ret.empty
             or col_data_cham == "(nenhuma)" or col_maquina == "(nenhuma)"
             or col_data_ret == "(nenhuma)" or not maq_col_ret):
         return df_ret
 
+    _usa_ini = col_hora_ini and col_hora_ini != "(nenhuma)" and col_hora_ini in df_ret.columns
+    _usa_fim = col_hora_fim and col_hora_fim != "(nenhuma)" and col_hora_fim in df_ret.columns
+
     df_ret = df_ret.copy()
     df_ret["Tempo_min"] = None
 
     for idx, row_ret in df_ret.iterrows():
-        maq   = row_ret.get(maq_col_ret)
-        dt_ret = row_ret.get(col_data_ret)
+        maq    = row_ret.get(maq_col_ret)
+        dt_ret = row_ret.get(col_data_ret)   # timestamp de envio do formulário
         if pd.isna(maq) or pd.isna(dt_ret):
             continue
 
-        # Chamados da mesma máquina, anteriores ao retorno
+        # ── Modo preciso: hora início e/ou hora fim informadas ──────────────
+        if _usa_ini and _usa_fim:
+            # Tempo de execução puro: fim - início
+            dt_inicio = _parse_hora(row_ret.get(col_hora_ini), dt_ret)
+            dt_fim    = _parse_hora(row_ret.get(col_hora_fim), dt_ret)
+            if dt_inicio and dt_fim and pd.notna(dt_inicio) and pd.notna(dt_fim):
+                delta_min = round((dt_fim - dt_inicio).total_seconds() / 60)
+                if 0 < delta_min <= 1440:   # máx 24 h de execução
+                    df_ret.at[idx, "Tempo_min"] = delta_min
+            continue
+
+        if _usa_fim:
+            # Chamado → conclusão (sem tempo de preenchimento)
+            dt_conclusao = _parse_hora(row_ret.get(col_hora_fim), dt_ret)
+            if dt_conclusao is None or pd.isna(dt_conclusao):
+                dt_conclusao = dt_ret  # fallback para timestamp de envio
+            mask = (
+                (df_ch[col_maquina] == maq) &
+                (df_ch[col_data_cham] <= dt_conclusao)
+            )
+            candidatos = df_ch.loc[mask, col_data_cham].dropna()
+            if candidatos.empty:
+                continue
+            dt_cham   = candidatos.max()
+            delta_min = round((dt_conclusao - dt_cham).total_seconds() / 60)
+            if 0 < delta_min <= 43200:
+                df_ret.at[idx, "Tempo_min"] = delta_min
+            continue
+
+        # ── Modo fallback: usa timestamps de envio ──────────────────────────
         mask = (
             (df_ch[col_maquina] == maq) &
             (df_ch[col_data_cham] <= dt_ret)
@@ -310,9 +381,8 @@ def calcular_tempos(df_ch, df_ret, col_data_cham, col_maquina, col_data_ret, maq
         if candidatos.empty:
             continue
 
-        # Pega o mais próximo (mais recente)
-        dt_cham = candidatos.max()
-        delta_min = (dt_ret - dt_cham).total_seconds() / 60
+        dt_cham   = candidatos.max()
+        delta_min = round((dt_ret - dt_cham).total_seconds() / 60)
 
         # Descarta valores negativos ou absurdos (> 30 dias)
         if 0 < delta_min <= 43200:
@@ -558,32 +628,37 @@ def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_d
         maq_label = f"{maq} – {nome_maq.title()}" if nome_maq else maq
 
         rows.append({
-            "Patrimônio"        : maq,
-            "Máquina"           : maq_label,
-            "Descrição / Tarefa": problema[:100],
-            "Data do Chamado"   : data_fmt,
-            "Mecânico"          : mecanico,
-            "📅 Data Planejada" : "",    # usuário preenche antes de colar
+            "Patrimônio"      : maq,
+            "Tarefa"          : problema[:120],
+            "Tipo"            : "",          # preencher: Lubrificação / Inspeção / Troca / etc.
+            "Frequência_Dias" : "",          # preencher: ex. 30
+            "Última_Execução" : data_fmt,    # data do chamado = última ocorrência
+            "Próxima_Execução": "",          # preencher: data planejada para fazer a PM
+            "Responsável"     : mecanico if mecanico not in ("—","nan","") else "",
+            "Prioridade"      : "",          # preencher: Alta / Média / Baixa
+            "Observações"     : f"Chamado: {nome_maq.title()}" if nome_maq else "",
+            "Último_Alerta"   : "",          # gerenciado automaticamente pelo Bot Atlas
         })
 
     df_out = pd.DataFrame(rows)
 
-    # Ordena pelo mais recente (tentativa com a coluna data original)
+    # Ordena pelo mais recente
     if col_data != "(nenhuma)" and col_data in df_p.columns:
         datas_sort = pd.to_datetime(df_p[col_data], errors="coerce")
         df_out.insert(0, "_sort", datas_sort.values)
         df_out = df_out.sort_values("_sort", ascending=False).drop(columns=["_sort"])
 
-    st.caption(f"**{len(df_out)} chamados preventivos** encontrados. Preencha a coluna '📅 Data Planejada' e cole na planilha de PMs.")
+    st.caption(f"**{len(df_out)} chamados preventivos** — colunas já no formato da planilha de PMs. "
+               f"Preencha **Tipo**, **Frequência_Dias**, **Próxima_Execução** e **Prioridade** antes de colar.")
 
     st.dataframe(df_out, use_container_width=True, hide_index=True)
 
-    # Download TSV – abre no Excel com colunas separadas
+    # Download TSV – colunas já prontas para colar na planilha de PMs
     tsv_bytes = df_out.to_csv(index=False, sep="\t", encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
-        "⬇ Baixar tabela (TSV – abre no Excel/Sheets)",
+        "⬇ Baixar (TSV – cole direto na planilha de PMs)",
         data=tsv_bytes,
-        file_name="chamados_preventivos.tsv",
+        file_name="chamados_preventivos_pm.tsv",
         mime="text/tab-separated-values",
         use_container_width=True,
     )
@@ -767,7 +842,7 @@ with st.sidebar:
     if st.button("⚙️ Redefinir mapeamento de colunas"):
         # Limpa session state dos seletores de coluna para forçar re-detecção automática
         for _k in ["c_data","c_maq","c_pat","c_prob","c_enc","c_tipo",
-                   "r_data","r_mec","r_maq","r_serv","r_stat"]:
+                   "r_data","r_mec","r_maq","r_serv","r_stat","r_h_ini","r_h_fim"]:
             if _k in st.session_state:
                 del st.session_state[_k]
         st.cache_data.clear()
@@ -833,13 +908,18 @@ else:
 
 st.sidebar.subheader("Colunas – Retornos")
 if not df_retornos.empty:
-    col_data_ret = col_select("Data/Hora", df_retornos, ["timestamp","data","hora","conclusao"], "r_data")
-    col_mecanico = col_select("Mecânico",  df_retornos, ["mecanico","mecânico","tecnico","técnico","executor"], "r_mec")
-    col_maq_ret  = col_select("Máquina",   df_retornos, ["maquina","máquina","equipamento","ativo"], "r_maq")
-    col_servico  = col_select("Serviço",   df_retornos, ["servico","serviço","atividade","descri","relatorio"], "r_serv")
-    col_status   = col_select("Status",    df_retornos, ["status","situacao","situação","concluido"], "r_stat")
+    col_data_ret     = col_select("Data/Hora",            df_retornos, ["timestamp","data","hora","conclusao"], "r_data")
+    col_mecanico     = col_select("Mecânico",             df_retornos, ["mecanico","mecânico","tecnico","técnico","executor"], "r_mec")
+    col_maq_ret      = col_select("Máquina",              df_retornos, ["maquina","máquina","equipamento","ativo"], "r_maq")
+    col_servico      = col_select("Serviço",              df_retornos, ["servico","serviço","atividade","descri","relatorio"], "r_serv")
+    col_status       = col_select("Status",               df_retornos, ["status","situacao","situação","concluido"], "r_stat")
+    col_hora_ini_ret = col_select("Hora Início (opcional)", df_retornos,
+                                  ["hora_ini","inicio","início","h_ini","inicio_atend","inicio_serv"], "r_h_ini")
+    col_hora_fim_ret = col_select("Hora Conclusão (opcional)", df_retornos,
+                                  ["hora_fim","conclusao","conclusão","termino","término","fim","h_fim","hora_fim_serv"], "r_h_fim")
 else:
     col_data_ret = col_mecanico = col_maq_ret = col_servico = col_status = "(nenhuma)"
+    col_hora_ini_ret = col_hora_fim_ret = "(nenhuma)"
 
 # ── Pré-processar ──────────────────────────────────────────────────────────────
 if not df_chamados.empty and col_data_cham != "(nenhuma)":
@@ -889,7 +969,8 @@ for _df, _col in [(df_chamados, col_maquina), (df_retornos, maq_col_ret)]:
         _df.reset_index(drop=True, inplace=True)
 
 # ── Calcular tempos ────────────────────────────────────────────────────────────
-df_retornos = calcular_tempos(df_chamados, df_retornos, col_data_cham, col_maquina, col_data_ret, maq_col_ret)
+df_retornos = calcular_tempos(df_chamados, df_retornos, col_data_cham, col_maquina, col_data_ret, maq_col_ret,
+                              col_hora_ini=col_hora_ini_ret, col_hora_fim=col_hora_fim_ret)
 
 # ── Carregar e processar preventiva ───────────────────────────────────────────
 df_prev_raw = load_preventiva(sheet_preventiva, gid_preventiva)
