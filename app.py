@@ -511,15 +511,7 @@ def _painel_novos_chamados_preventivos(df_ch, col_tipo, col_maq, col_prob, col_d
         return
 
     if col_tipo_real != col_tipo:
-        st.caption(f"ℹ️ Coluna detectada automaticamente: **{col_tipo_real}**")
-
-    # ── Diagnóstico sempre visível ────────────────────────────────────────
-    st.info(f"🔎 **Coluna detectada:** `{col_tipo_real}` — **Total de chamados carregados:** {len(df_ch)}")
-    _vals = df_ch[col_tipo_real].astype(str).str.strip().value_counts(dropna=False).head(15)
-    _df_diag = _vals.reset_index()
-    _df_diag.columns = ["Valor na planilha", "Qtd"]
-    st.caption("Todos os valores encontrados na coluna (incluindo vazios como 'nan'):")
-    st.dataframe(_df_diag, hide_index=True, use_container_width=False)
+        st.caption(f"ℹ️ Coluna detectada: **{col_tipo_real}**")
 
     mask_prev = _mask_preventiva(df_ch, col_tipo_real)
     df_p = df_ch[mask_prev].copy()
@@ -1354,8 +1346,15 @@ with tab_prev:
         st.markdown("---")
         _tab_a, _tab_b = st.tabs(["🆕 Novos Chamados", "📥 Importar do Histórico"])
         with _tab_a:
-            # Usa df_chamados_full (antes da normalização) SEM filtro de período
-            _painel_novos_chamados_preventivos(df_chamados_full, col_tipo_manut, col_maquina, col_problema,
+            # Usa df_chamados_full filtrado pelo período global
+            _df_full_f = df_chamados_full.copy()
+            if col_data_cham != "(nenhuma)" and col_data_cham in _df_full_f.columns:
+                _df_full_f[col_data_cham] = pd.to_datetime(_df_full_f[col_data_cham], errors="coerce")
+                _df_full_f = _df_full_f[
+                    (_df_full_f[col_data_cham] >= dt_ini) &
+                    (_df_full_f[col_data_cham] <  dt_fim)
+                ]
+            _painel_novos_chamados_preventivos(_df_full_f, col_tipo_manut, col_maquina, col_problema,
                                                col_data_cham, col_mecanico, catalogo)
         with _tab_b:
             _gerar_importacao_historico(df_ch, col_tipo_manut, col_maquina, col_problema,
@@ -1402,8 +1401,15 @@ with tab_prev:
 
         # ── Novos chamados preventivos (principal novidade) ────────────────────
         with sub5:
-            # Usa df_chamados_full (antes da normalização) SEM filtro de período
-            _painel_novos_chamados_preventivos(df_chamados_full, col_tipo_manut, col_maquina, col_problema,
+            # Usa df_chamados_full filtrado pelo período global
+            _df_full_f = df_chamados_full.copy()
+            if col_data_cham != "(nenhuma)" and col_data_cham in _df_full_f.columns:
+                _df_full_f[col_data_cham] = pd.to_datetime(_df_full_f[col_data_cham], errors="coerce")
+                _df_full_f = _df_full_f[
+                    (_df_full_f[col_data_cham] >= dt_ini) &
+                    (_df_full_f[col_data_cham] <  dt_fim)
+                ]
+            _painel_novos_chamados_preventivos(_df_full_f, col_tipo_manut, col_maquina, col_problema,
                                                col_data_cham, col_mecanico, catalogo)
 
         # ── Importar do histórico (agrupado por máquina) ───────────────────────
