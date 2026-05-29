@@ -965,27 +965,36 @@ else:
 hoje = datetime.today().date()
 max_val = max(max_date, hoje)
 
-# Botões rápidos de período (atualizados por JS via session_state)
-_primeiro_dia_mes = hoje.replace(day=1)
-_primeiro_dia_ano = hoje.replace(month=1, day=1)
-_atalhos = {
-    "pb_hoje":  (hoje,                     hoje),
-    "pb_7d":    (hoje - timedelta(days=6),  hoje),
-    "pb_30d":   (hoje - timedelta(days=29), hoje),
-    "pb_mes":   (_primeiro_dia_mes,         hoje),
-    "pb_ano":   (_primeiro_dia_ano,         hoje),
-    "pb_tudo":  (min_date,                  hoje),
-}
-for _k, _v in _atalhos.items():
-    if st.session_state.get(_k):
-        st.session_state["periodo_global"] = _v
-        st.session_state[_k] = False
+# ── Filtros rápidos de período na sidebar ─────────────────────────────────
+st.sidebar.markdown("**Atalhos de período**")
+_bc1, _bc2, _bc3 = st.sidebar.columns(3)
+_pini_novo = _pfim_novo = None
+if _bc1.button("Hoje",     use_container_width=True): _pini_novo, _pfim_novo = hoje, hoje
+if _bc2.button("7 dias",   use_container_width=True): _pini_novo, _pfim_novo = hoje - timedelta(days=6), hoje
+if _bc3.button("30 dias",  use_container_width=True): _pini_novo, _pfim_novo = hoje - timedelta(days=29), hoje
+_bc4, _bc5, _bc6 = st.sidebar.columns(3)
+if _bc4.button("Mês",      use_container_width=True): _pini_novo, _pfim_novo = hoje.replace(day=1), hoje
+if _bc5.button("Ano",      use_container_width=True): _pini_novo, _pfim_novo = hoje.replace(month=1, day=1), hoje
+if _bc6.button("Tudo",     use_container_width=True): _pini_novo, _pfim_novo = min_date, hoje
 
-_val_periodo = st.session_state.get("periodo_global", (min_date, hoje))
-periodo = st.sidebar.date_input("Período", value=_val_periodo,
-                                 min_value=min_date, max_value=max_val,
-                                 key="periodo_global")
+# Guarda o atalho escolhido sem conflitar com o widget key
+if _pini_novo:
+    st.session_state["_p_ini"] = _pini_novo
+    st.session_state["_p_fim"] = _pfim_novo
+
+_def_ini = st.session_state.get("_p_ini", min_date)
+_def_fim = st.session_state.get("_p_fim", hoje)
+
+# Garante que são objetos date (não datetime)
+if hasattr(_def_ini, "date"): _def_ini = _def_ini.date()
+if hasattr(_def_fim, "date"): _def_fim = _def_fim.date()
+
+periodo = st.sidebar.date_input("Período", value=(_def_ini, _def_fim),
+                                 min_value=min_date, max_value=max_val)
 if isinstance(periodo, (list, tuple)) and len(periodo) == 2:
+    # Atualiza session state com o valor manual do seletor
+    st.session_state["_p_ini"] = periodo[0]
+    st.session_state["_p_fim"] = periodo[1]
     dt_ini, dt_fim = pd.Timestamp(periodo[0]), pd.Timestamp(periodo[1]) + timedelta(days=1)
 else:
     dt_ini, dt_fim = pd.Timestamp(min_date), pd.Timestamp(hoje) + timedelta(days=1)
@@ -1045,21 +1054,6 @@ def nome_maquina(codigo: str) -> str:
     if info and info.get("nome"):
         return f"{codigo} – {info['nome'].title()}"
     return str(codigo)
-
-# ── Filtro rápido de período — acima de todas as abas ─────────────────────────
-with st.container():
-    _fa, _fb, _fc, _fd, _fe, _ff = st.columns(6)
-    _fa.button("📅 Hoje",         key="pb_hoje",  use_container_width=True)
-    _fb.button("📅 7 dias",       key="pb_7d",    use_container_width=True)
-    _fc.button("📅 30 dias",      key="pb_30d",   use_container_width=True)
-    _fd.button("📅 Mês atual",    key="pb_mes",   use_container_width=True)
-    _fe.button("📅 Ano atual",    key="pb_ano",   use_container_width=True)
-    _ff.button("📅 Todo período", key="pb_tudo",  use_container_width=True)
-
-    _p0, _p1 = (periodo[0], periodo[1]) if isinstance(periodo, (list,tuple)) and len(periodo)==2 else (dt_ini.date(), dt_fim.date()-timedelta(days=1))
-    st.caption(f"🗓 Período ativo: **{_p0.strftime('%d/%m/%Y')}** → **{_p1.strftime('%d/%m/%Y')}** — "
-               f"{len(df_ch)} chamados · {len(df_ret)} atendimentos  *(ajuste no menu lateral ou clique nos botões acima)*")
-st.markdown("---")
 
 tab_visao, tab_mecanico, tab_maquina, tab_historico, tab_prev, tab_relatorio, tab_dados = st.tabs([
     "📊 Visão Geral", "👷 Por Mecânico", "🏭 Por Máquina", "📋 Histórico",
