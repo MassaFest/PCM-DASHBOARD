@@ -964,11 +964,31 @@ else:
 
 hoje = datetime.today().date()
 max_val = max(max_date, hoje)
-periodo = st.sidebar.date_input("Período", value=(min_date, hoje), min_value=min_date, max_value=max_val)
-if len(periodo) == 2:
+
+# Botões rápidos de período (atualizados por JS via session_state)
+_primeiro_dia_mes = hoje.replace(day=1)
+_primeiro_dia_ano = hoje.replace(month=1, day=1)
+_atalhos = {
+    "pb_hoje":  (hoje,                     hoje),
+    "pb_7d":    (hoje - timedelta(days=6),  hoje),
+    "pb_30d":   (hoje - timedelta(days=29), hoje),
+    "pb_mes":   (_primeiro_dia_mes,         hoje),
+    "pb_ano":   (_primeiro_dia_ano,         hoje),
+    "pb_tudo":  (min_date,                  hoje),
+}
+for _k, _v in _atalhos.items():
+    if st.session_state.get(_k):
+        st.session_state["periodo_global"] = _v
+        st.session_state[_k] = False
+
+_val_periodo = st.session_state.get("periodo_global", (min_date, hoje))
+periodo = st.sidebar.date_input("Período", value=_val_periodo,
+                                 min_value=min_date, max_value=max_val,
+                                 key="periodo_global")
+if isinstance(periodo, (list, tuple)) and len(periodo) == 2:
     dt_ini, dt_fim = pd.Timestamp(periodo[0]), pd.Timestamp(periodo[1]) + timedelta(days=1)
 else:
-    dt_ini, dt_fim = pd.Timestamp(min_date), pd.Timestamp(max_date) + timedelta(days=1)
+    dt_ini, dt_fim = pd.Timestamp(min_date), pd.Timestamp(hoje) + timedelta(days=1)
 
 mecánicos = []
 if not df_retornos.empty and col_mecanico != "(nenhuma)":
@@ -1025,6 +1045,21 @@ def nome_maquina(codigo: str) -> str:
     if info and info.get("nome"):
         return f"{codigo} – {info['nome'].title()}"
     return str(codigo)
+
+# ── Filtro rápido de período — acima de todas as abas ─────────────────────────
+with st.container():
+    _fa, _fb, _fc, _fd, _fe, _ff = st.columns(6)
+    _fa.button("📅 Hoje",         key="pb_hoje",  use_container_width=True)
+    _fb.button("📅 7 dias",       key="pb_7d",    use_container_width=True)
+    _fc.button("📅 30 dias",      key="pb_30d",   use_container_width=True)
+    _fd.button("📅 Mês atual",    key="pb_mes",   use_container_width=True)
+    _fe.button("📅 Ano atual",    key="pb_ano",   use_container_width=True)
+    _ff.button("📅 Todo período", key="pb_tudo",  use_container_width=True)
+
+    _p0, _p1 = (periodo[0], periodo[1]) if isinstance(periodo, (list,tuple)) and len(periodo)==2 else (dt_ini.date(), dt_fim.date()-timedelta(days=1))
+    st.caption(f"🗓 Período ativo: **{_p0.strftime('%d/%m/%Y')}** → **{_p1.strftime('%d/%m/%Y')}** — "
+               f"{len(df_ch)} chamados · {len(df_ret)} atendimentos  *(ajuste no menu lateral ou clique nos botões acima)*")
+st.markdown("---")
 
 tab_visao, tab_mecanico, tab_maquina, tab_historico, tab_prev, tab_relatorio, tab_dados = st.tabs([
     "📊 Visão Geral", "👷 Por Mecânico", "🏭 Por Máquina", "📋 Histórico",
@@ -1132,46 +1167,12 @@ with tab_mecanico:
 with tab_maquina:
     st.subheader("Máquinas com mais manutenção")
 
-    # ── Filtro de período próprio desta aba ────────────────────────────────
-    _hoje = datetime.today().date()
-    _pm_fa, _pm_fb, _pm_fc, _pm_fd = st.columns([1, 1, 1, 3])
-    with _pm_fa:
-        if st.button("📅 Hoje",   key="maq_hoje"):   st.session_state["maq_p"] = (_hoje, _hoje)
-    with _pm_fb:
-        if st.button("📅 7 dias", key="maq_7d"):
-            st.session_state["maq_p"] = (_hoje - timedelta(days=6), _hoje)
-    with _pm_fc:
-        if st.button("📅 30 dias",key="maq_30d"):
-            st.session_state["maq_p"] = (_hoje - timedelta(days=29), _hoje)
-    with _pm_fd:
-        _default_range = st.session_state.get("maq_p", (dt_ini.date(), dt_fim.date()))
-        _maq_periodo = st.date_input(
-            "Período personalizado",
-            value=_default_range,
-            key="maq_periodo_input",
-            label_visibility="collapsed"
-        )
-        if isinstance(_maq_periodo, (list, tuple)) and len(_maq_periodo) == 2:
-            st.session_state["maq_p"] = (_maq_periodo[0], _maq_periodo[1])
-
-    _p = st.session_state.get("maq_p", (dt_ini.date(), dt_fim.date()))
-    _maq_ini = pd.Timestamp(_p[0])
-    _maq_fim = pd.Timestamp(_p[1]) + timedelta(days=1)
-
-    # Aplica filtro de período nos dados desta aba
-    df_ch_m = df_ch.copy()
-    df_ret_m = df_ret.copy()
-    if col_data_cham != "(nenhuma)" and col_data_cham in df_ch_m.columns:
-        df_ch_m = df_ch_m[(df_ch_m[col_data_cham] >= _maq_ini) & (df_ch_m[col_data_cham] < _maq_fim)]
-    if col_data_ret != "(nenhuma)" and col_data_ret in df_ret_m.columns:
-        df_ret_m = df_ret_m[(df_ret_m[col_data_ret] >= _maq_ini) & (df_ret_m[col_data_ret] < _maq_fim)]
+    # Usa df_ch / df_ret já filtrados pelo período global (botões acima das abas)
+    df_ch_m  = df_ch
+    df_ret_m = df_ret
 
     # Recalcula MTBF/MTTR para o período selecionado
     df_mtbf_m = calcular_mtbf_mttr(df_ch_m, df_ret_m, col_data_cham, col_maquina, col_data_ret, maq_col_ret)
-
-    st.caption(f"Período: **{_p[0].strftime('%d/%m/%Y')}** a **{_p[1].strftime('%d/%m/%Y')}** — "
-               f"{len(df_ch_m)} chamados · {len(df_ret_m)} atendimentos")
-    st.markdown("---")
 
     maq_src_col = col_maquina if (col_maquina != "(nenhuma)" and not df_ch_m.empty) else None
     maq_ret_col = maq_col_ret if (maq_col_ret and not df_ret_m.empty) else None
